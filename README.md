@@ -1,6 +1,4 @@
 # LogStatix
-A powerful and efficient tool to parse and analyze web server logs for IIS and Apache. This tool is designed for security analysts and administrators to detect suspicious activities, analyze traffic, and extract useful statistics from server logs.
-
 ## Features
 ### 1. Filter Attack Requests
 * Detects and filters malicious requests, including:
