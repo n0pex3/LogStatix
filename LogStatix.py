@@ -7,6 +7,14 @@ import csv
 import time
 import urllib.parse
 from collections import deque
+import pandas as pd
+from typing import Optional, Dict
+import base64
+import html
+import json
+import tensorflow as tf
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 
 class UserAgent:
@@ -67,15 +75,14 @@ class ManipulationFiles:
 
     # write log into csv
     def write_log_csv(self, path_log: str, content: deque):
-        f = open(path_log, 'a', encoding=self.encoding, newline='')
-        writer = csv.writer(f)
-        writer.writerows(content)
+        with open(path_log, 'a', encoding=self.encoding, newline='') as f:
+            writer = csv.writer(f)
+            writer.writerows(content)
 
     # write log into txt
     def write_log_txt(self, path_log: str, content: str):
-        f = open(path_log, 'a', encoding=self.encoding, newline='')
-        f.write(content)
-        f.close()
+        with open(path_log, 'a', encoding=self.encoding, newline='') as f:
+            f.write(content)
 
 
 class Export:
@@ -88,12 +95,12 @@ class Export:
 
     def __init__(self):
         self.manipulation_file = ManipulationFiles()
-        self.path_user_agent = 'result\\user_agent_official.csv'
-        self.path_user_agent_non_official = 'result\\user_agent_non_official.csv'
-        self.path_statistic_ip = 'result\\statistic_ip.csv'
-        self.path_file_request = 'result\\file_request.csv'
-        self.path_file_request_2 = 'result\\file_request_count.csv'
-        self.path_username = 'result\\username.csv'
+        self.path_user_agent = os.path.join('result','user_agent_official.csv')
+        self.path_user_agent_non_official = os.path.join('result','user_agent_non_official.csv')
+        self.path_statistic_ip = os.path.join('result','statistic_ip.csv')
+        self.path_file_request = os.path.join('result','file_request.csv')
+        self.path_file_request_2 = os.path.join('result','file_request_count.csv')
+        self.path_username = os.path.join('result','username.csv')
         self.batch_size = 1000
         # deque() for higher performance pop than list
         self.buffer = deque()
@@ -102,7 +109,7 @@ class Export:
     def export_remain(self, path_log: str):
         if self.buffer:
             self.manipulation_file.write_log_csv(path_log, self.buffer)
-            self.buffer.clear()
+        self.buffer.clear()
 
     def export_user_agent(self, path_extract: str):
         # official user-agent
@@ -200,11 +207,13 @@ class Utility:
         print('1. IIS')
         print('2. Apache')
         selection_mode = input('Please choice: ')
-        match selection_mode:
-            case '1':
-                return 1, path_zip
-            case '2':
-                return 2, path_zip
+        mode_ai = input('Use AI (y/n):')
+        return path_zip, selection_mode, mode_ai
+        # match selection_mode:
+        #     case '1':
+        #         return 1, path_zip
+        #     case '2':
+        #         return 2, path_zip
 
 
 class ScannerVulnerability:
@@ -434,26 +443,68 @@ class ScannerVulnerability:
             # r'/ScriptResource.axd\?d=',
         ]
         self.compiled_false_pattern = [re.compile(pattern, re.IGNORECASE) for pattern in self.false_pattern]
-        self.compiled_hex_encoding = re.compile(r'%[0-9a-fA-F]{2}')
-        self.compiled_hex_encoding_2 = re.compile(r'x[0-9a-fA-F]{2}')
-        self.complied_break_line = re.compile(r'\r\n')
-        self.compiled_unicode_encoding = re.compile(r'\\u[0-9a-fA-F]{4}')
+        self.compiled_hex_encoding = re.compile(r'%[0-9a-fA-F]{2}')  # %XX
+        self.compiled_hex_encoding_2 = re.compile(r'x[0-9a-fA-F]{2}')  # \xXX
+        self.compiled_unicode_encoding = re.compile(r'\\u[0-9a-fA-F]{4}')  # \uXXXX
+        self.compiled_break_line = re.compile(r'[\r\n]+')  # \r\n or \n
+        self.compiled_non_printable = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
+        self.compiled_js_escape = re.compile(r'\\x[0-9a-fA-F]{2}')  # JavaScript escape \xXX
+        # Load model AI to classify
+        self.config = self._load_config(r'./model/config.json')
+        self.encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        expected_dim = self.config.get('embedding_dim', 384)
+        sample_embedding = self.encoder.encode("test").shape[0]
+        if sample_embedding != expected_dim:
+            raise ValueError(f"Embedding dim mismatch: expected {expected_dim}, got {sample_embedding}")
+        try:
+            self.model = tf.keras.models.load_model(r'./model/model.h5')
+        except Exception as e:
+            print(f"Error loading model from : {str(e)}")
+            raise
 
-    def decode_url(self, line: str) -> str:
-        # URL decode
-        decoded_line = urllib.parse.unquote(line)
-        decoded_line = html.unescape(decoded_line)
-        # Remove NULL
-        decoded_line = decoded_line.replace('\x00', ' ')
-        decoded_line = re.sub(r'x1a', '', decoded_line)
-        # Decode potential hexadecimal encodings
-        decoded_line = self.compiled_hex_encoding.sub(lambda x: chr(int(x.group(0)[1:], 16)), decoded_line)
-        decoded_line = self.compiled_hex_encoding_2.sub(lambda x: chr(int(x.group(0)[1:], 16)), decoded_line)
-        # Decode potential Unicode encodings (e.g., \u003C)
-        decoded_line = self.compiled_unicode_encoding.sub(lambda x: chr(int(x.group(0)[2:], 16)), decoded_line)
-        # Remove break line
-        decoded_line = self.complied_break_line.sub('', decoded_line)
-        return decoded_line
+    def decode_url(self, line: str) ->  Optional[str]:
+        try:
+            decoded = line
+            while True:
+                original = decoded
+                # 1. Decode HTML entities (ex: &amp; -> &)
+                decoded = html.unescape(decoded)
+                # 2. Decode URL encoding (%XX, including double encoding)
+                while self.compiled_hex_encoding.search(decoded):
+                    decoded = urllib.parse.unquote(decoded)
+                # 3. Decode \xXX (hex encoding JavaScript)
+                decoded = self.compiled_hex_encoding_2.sub(
+                    lambda x: chr(int(x.group(0)[1:], 16)), decoded
+                )
+                decoded = self.compiled_js_escape.sub(
+                    lambda x: chr(int(x.group(0)[2:], 16)), decoded
+                )
+                # 4. Decode Unicode escape (\uXXXX)
+                decoded = self.compiled_unicode_encoding.sub(
+                    lambda x: chr(int(x.group(0)[2:], 16)), decoded
+                )
+                # 5. decode base64
+                try:
+                    if re.match(r'^[A-Za-z0-9+/=]+$', decoded) and len(decoded) % 4 == 0:
+                        decoded_base64 = base64.b64decode(decoded).decode('utf-8', errors='ignore')
+                        if all(ord(c) < 128 for c in decoded_base64):
+                            decoded = decoded_base64
+                except:
+                    pass
+                # 6. exclude break line
+                decoded = self.compiled_break_line.sub('', decoded)
+                decoded = self.compiled_non_printable.sub('', decoded)
+                # 7. exclude null bytes and replace by space
+                decoded = decoded.replace('\x00', ' ')
+                if decoded == original:
+                    break
+            decoded = decoded.encode('ascii', errors='ignore').decode('ascii')
+            decoded = decoded.strip()
+            return decoded if decoded else None
+        except Exception as e:
+            print(f"Error decoding: '{line}': {str(e)}")
+            return None
+
 
     def detect_sql_injection(self, line: str) -> bool:
         for pattern in self.compiled_sql_injection_patterns:
@@ -521,6 +572,38 @@ class ScannerVulnerability:
         else:
             return ''
 
+    def _load_config(self, config_path: str) -> Dict:
+        defaults = {
+            "embedding_dim": 384,
+            "threshold": 0.5,
+            "batch_size": 32,
+            "model_type": "cnn_gru",
+            "num_classes": 1  # Binary
+        }
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                # print(f"Loaded config: {config}")
+                # Merge with defaults
+                defaults.update(config)
+            else:
+                print(f"Config file {config_path} not found, using defaults: {defaults}")
+        except Exception as e:
+            print(f"Error loading config {config_path}: {str(e)}, using defaults: {defaults}")
+        return defaults
+
+    def classify_request(self, decoded: str) -> Dict:
+        embeddings = self.encoder.encode(decoded).reshape((1, self.config['embedding_dim']))
+        prediction = self.model.predict(embeddings, verbose=0)
+        probability = float(prediction[0][0])
+        threshold = self.config['threshold']
+        is_attack = probability > threshold
+        return {
+            "is_attack": is_attack,
+            "probability": probability,
+        }
+
 
 class CoreFunctionality:
     def __init__(self):
@@ -528,8 +611,8 @@ class CoreFunctionality:
         self.export = Export()
         self.scanner = ScannerVulnerability()
         self.manipulation_file = ManipulationFiles()
-        self.path_request_attack = 'result\\attack_request.csv'
-        self.path_no_user_agent = 'result\\no_user_agent.txt'
+        self.path_request_attack = os.path.join('result','attack_request.csv')
+        self.path_no_user_agent = os.path.join('result','no_user_agent.txt')
         self.normal_request = re.compile(r'^[a-zA-Z0-9;/&.,?+=_-]+$')
 
     # write header of feature 1, prevent if else to check per line
@@ -540,36 +623,43 @@ class CoreFunctionality:
 
     # Feature 1: Filter anomaly request
     # Because of over ram if save into list object and write to file later, we need write it directly, no need to save list object
-    def filter_export_anomaly_request(self, url: str, ip: str, status: str, time_request: str, user_agent: str, path_extract: str):
+    def filter_export_anomaly_request(self, url: str, ip: str, status: str, time_request: str, user_agent: str, path_extract: str, mode_ai: int):
         path_log = os.path.join(path_extract, self.path_request_attack)
-        if url.startswith('https://') or url.startswith('http://'):
-            url = url.strip('https://')
-            url = url.strip('http://')
-        if url:
-            if self.normal_request.match(url):
-                decoded_url = url
-            else:
-                decoded_url = self.scanner.decode_url(url)
-        
-            if not self.normal_request.match(decoded_url) and not self.scanner.detect_false_positive(decoded_url):
-                type_attack = self.scanner.dispatcher(decoded_url)
-                if len(self.export.buffer) >= self.export.batch_size:
-                    self.manipulation_file.write_log_csv(path_log, self.export.buffer)
-                    self.export.buffer.clear()
+        if url is not None:
+            if url.startswith('https://') or url.startswith('http://'):
+                url = url.strip('https://')
+                url = url.strip('http://')
+            if url:
+                if self.normal_request.match(url):
+                    decoded_url = url
                 else:
-                    content = [status, self.utilities.classify_success_or_fail(status), ip, url, time_request,
-                                type_attack, user_agent]
-                    self.export.buffer.append(content)
-        self.export.export_remain(path_log)
+                    decoded_url = self.scanner.decode_url(url)
+                if not self.normal_request.match(decoded_url) and not self.scanner.detect_false_positive(decoded_url):
+                    if mode_ai == 'y':
+                        classify_attack = self.scanner.classify_request(decoded_url)
+                        if classify_attack['is_attack'] and classify_attack['probability'] > 0.5:
+                            type_attack = self.scanner.dispatcher(decoded_url)
+                            content = [status, self.utilities.classify_success_or_fail(status), ip, url, time_request, type_attack, user_agent]
+                            self.export.buffer.append(content)
+                            if len(self.export.buffer) >= self.export.batch_size:
+                                self.manipulation_file.write_log_csv(path_log, self.export.buffer)
+                                self.export.buffer.clear()
+                    else:
+                        type_attack = self.scanner.dispatcher(decoded_url)
+                        content = [status, self.utilities.classify_success_or_fail(status), ip, url, time_request,
+                                   type_attack, user_agent]
+                        self.export.buffer.append(content)
+                        if len(self.export.buffer) >= self.export.batch_size:
+                            self.manipulation_file.write_log_csv(path_log, self.export.buffer)
+                            self.export.buffer.clear()
+            self.export.export_remain(path_log)
 
     # Feature 2: List unique user agent and count
     # Because we need to classify unique of user agent so cannot write it directly to file. If we write to file, we cannot count times of user agent
     def filter_unique_useragent(self, user_agent: str, line: str, path_extract: str):
-        if user_agent or user_agent != '' or user_agent != '-':
-            if Export.list_user_agent.get(user_agent) is None:
-                Export.list_user_agent[user_agent] = UserAgent()
-            else:
-                Export.list_user_agent[user_agent].increase_count()
+        if user_agent and user_agent != '-' and user_agent != '':
+            ua = Export.list_user_agent.setdefault(user_agent, UserAgent())
+            ua.increase_count()
         else:
             self.manipulation_file.write_log_txt(os.path.join(path_extract, self.path_no_user_agent), line)
 
@@ -588,10 +678,7 @@ class CoreFunctionality:
 
     # Feature 5: Statistic authentication username
     def enumerate_username(self, username: str):
-        if Export.list_username.get(username) is None:
-            Export.list_username[username] = 1
-        else:
-            Export.list_username[username] += 1
+        Export.list_username[username] = Export.list_username.get(username, 0) + 1
 
 
 class IIS(CoreFunctionality):
@@ -639,10 +726,10 @@ class IIS(CoreFunctionality):
             referer = columns[self.index_column_iis['cs(Referer)']]
             username = columns[self.index_column_iis['cs-username']]
             method = columns[self.index_column_iis['cs-method']]
-            return url_request, ip, user_agent, filename, status, param, time_request, referer, username, method
+            return ip, referer, url_request, status, user_agent, time_request, username, method, filename, param
 
     # Because column url not have parameter, it in another column, so we don't need to split like apache
-    def statistic_filename_request(self, time_request: str, method:str, filename_request: str, param: str, url_request: str, status: str):
+    def statistic_filename_request(self, time_request: str, method:str, url_request: str, status: str, filename_request: str, param: str):
         index_last_dot = filename_request.rfind('.')
         index_filename = filename_request.rfind('/')
         filename = filename_request[index_filename+1:]
@@ -673,7 +760,7 @@ class Apache(CoreFunctionality):
         # %v: version http
         # %>s: status
         # #Dangerous --> Change order column here
-        self.default_format_log = '%h %l %u %t %z %m %r %v %>s %b "%{Referer}i" "%{User-Agent}i"'
+        self.default_format_log = '%h %l %u %t %z %m %r %v %>s %b "%{Referer}i" "%{User-Agent}i" %a'
         # custom_format_log = 'a %t "%{Referer}i" %h a a a a %>s a a a %m %r %v "%{User-Agent}i"'
         self.valid_extension = re.compile(r'[!-~]+\.(php|xml|java|aspx|asp|py|rb|js|jsp|jspx|sh|jar|cgi|ashx|ascx|asmx)')
 
@@ -712,69 +799,70 @@ class Apache(CoreFunctionality):
                         username = parts[i].strip()
                     case '%m':
                         method = parts[i].strip()
-        return ip, referer, uri, status, user_agent, time_request, username, method
+        return ip, referer, uri, status, user_agent, time_request, username, method, None, None
 
     # Feature 4: Statistic request via extension of file
-    def statistic_filename_request(self, time_request:str, method:str, url: str, status: str):
+    def statistic_filename_request(self, time_request:str, method:str, url: str, status: str, filename_request=None, param=None):
         # get only request file, if not skip
-        valid_file_extension = self.valid_extension.search(url)
-        if valid_file_extension is not None and self.normal_request.search(url) is not None:
-            if url is not None:
-                # we use dictionary to classify and count unique url
-                if Export.list_file_request.get(url) is None:
-                    index_param = url.find('?')
-                    index_fragment = url.find('#')
-                    # Find filename via parameter
-                    if index_param != -1:
-                        sub_url = url[:index_param]
-                        index_last_path = sub_url.rfind('/')
-                        file_extension = url[index_last_path+1:index_param]
-                        if self.utilities.check_valid_file_extension(file_extension) is False:
-                            return
-                    # Find filename via fragment
-                    elif index_fragment != -1:
-                        sub_url = url[:index_fragment]
-                        index_last_path = sub_url.rfind('/')
-                        file_extension = url[index_last_path+1:index_fragment]
-                        if self.utilities.check_valid_file_extension(file_extension) is False:
-                            return
-                    # If any not found, get last path that is filename
-                    else:
-                        index_last_path = url.rindex('/')
-                        file_extension = url[index_last_path+1:]
-                        if self.utilities.check_valid_file_extension(file_extension) is False:
-                            return
-                    # Get extension of filename, we use reverse find because of double extension or triple extension
-                    index_dot_extension = file_extension.rfind('.')
-                    if valid_file_extension != -1:
-                        index_extension = index_dot_extension + 1
-                        # validate index of extension is not out of array string
-                        # Because file_extension is only filename, if index_extension it not equal len file_extension that abnormal
-                        while index_extension < len(file_extension) and (file_extension[index_extension].isalnum() or file_extension[index_extension] == '.'):
-                            index_extension += 1
-                        # Check extension that we split from url if it has got extension of webshell
-                        if index_extension != len(file_extension) and self.utilities.check_valid_file_extension(file_extension) is False:
-                            return
-                        # Get param and file request
-                        query_param = url[index_last_path+1:]
-                        index_param = query_param.find('?')
-                        index_file_request = url.find('?')
-                        param = filename_request = None
+        if url is not None:
+            valid_file_extension = self.valid_extension.search(url)
+            if valid_file_extension is not None and self.normal_request.search(url) is not None:
+                if url is not None:
+                    # we use dictionary to classify and count unique url
+                    if Export.list_file_request.get(url) is None:
+                        index_param = url.find('?')
+                        index_fragment = url.find('#')
+                        # Find filename via parameter
                         if index_param != -1:
-                            param = query_param[index_param+1:]
-                            filename_request = url[:index_file_request]
-                        # ['time_request, post, filename', 'count', 'extension', 'param', 'file_request', 'url', 'success']
-                        file_request = FileRequest(time_request, 1, file_extension[:index_extension], 1,
-                                                   file_extension[index_dot_extension+1:index_extension], param,
-                                                   filename_request, self.utilities.classify_success_or_fail(status))
-                        Export.list_file_request[url] = file_request
-                        Export.list_file_count[file_extension[:index_extension]] = 0
-                elif method.lower() == 'post' and Export.list_file_request.get(url):
-                    # increase post request, maybe upload file
-                    Export.list_file_request[url].increase_post()
-                    Export.list_file_request[url].increase_count()
-                else:
-                    Export.list_file_request[url].increase_count()
+                            sub_url = url[:index_param]
+                            index_last_path = sub_url.rfind('/')
+                            file_extension = url[index_last_path+1:index_param]
+                            if self.utilities.check_valid_file_extension(file_extension) is False:
+                                return
+                        # Find filename via fragment
+                        elif index_fragment != -1:
+                            sub_url = url[:index_fragment]
+                            index_last_path = sub_url.rfind('/')
+                            file_extension = url[index_last_path+1:index_fragment]
+                            if self.utilities.check_valid_file_extension(file_extension) is False:
+                                return
+                        # If any not found, get last path that is filename
+                        else:
+                            index_last_path = url.rindex('/')
+                            file_extension = url[index_last_path+1:]
+                            if self.utilities.check_valid_file_extension(file_extension) is False:
+                                return
+                        # Get extension of filename, we use reverse find because of double extension or triple extension
+                        index_dot_extension = file_extension.rfind('.')
+                        if valid_file_extension != -1:
+                            index_extension = index_dot_extension + 1
+                            # validate index of extension is not out of array string
+                            # Because file_extension is only filename, if index_extension it not equal len file_extension that abnormal
+                            while index_extension < len(file_extension) and (file_extension[index_extension].isalnum() or file_extension[index_extension] == '.'):
+                                index_extension += 1
+                            # Check extension that we split from url if it has got extension of webshell
+                            if index_extension != len(file_extension) and self.utilities.check_valid_file_extension(file_extension) is False:
+                                return
+                            # Get param and file request
+                            query_param = url[index_last_path+1:]
+                            index_param = query_param.find('?')
+                            index_file_request = url.find('?')
+                            param = filename_request = None
+                            if index_param != -1:
+                                param = query_param[index_param+1:]
+                                filename_request = url[:index_file_request]
+                            # ['time_request, post, filename', 'count', 'extension', 'param', 'file_request', 'url', 'success']
+                            file_request = FileRequest(time_request, 1, file_extension[:index_extension], 1,
+                                                       file_extension[index_dot_extension+1:index_extension], param,
+                                                       filename_request, self.utilities.classify_success_or_fail(status))
+                            Export.list_file_request[url] = file_request
+                            Export.list_file_count[file_extension[:index_extension]] = 0
+                    elif method.lower() == 'post' and Export.list_file_request.get(url):
+                        # increase post request, maybe upload file
+                        Export.list_file_request[url].increase_post()
+                        Export.list_file_request[url].increase_count()
+                    else:
+                        Export.list_file_request[url].increase_count()
 
 
 class Main:
@@ -785,50 +873,63 @@ class Main:
         self.manipulation_files = ManipulationFiles()
         self.export = Export()
 
-    def run(self):
-        selection_mode, path_zip = self.utilities.input_mode_path()
-        # Zip file to parse multiple log
-        start = time.time()
-        # prepare env
-        path_extract = self.manipulation_files.unzip(path_zip)
-        os.mkdir(os.path.join(path_extract, 'result'))
-        # write header feature 1 
-        self.apache.write_header_attack_request(path_extract)
-        if path_extract is not None:
-            for root, d_names, f_names in os.walk(path_extract):
-                # skip folder result
-                if root.find('\\result') != -1:
-                    continue
-                for f in f_names:
-                    path_log = os.path.join(root, f)
-                    file_log = open(path_log, 'r', encoding='cp437')
-                    for line in file_log.readlines():
-                        match selection_mode:
-                            # IIS
-                            case 1:
-                                columns = self.iis.identify_column(line)
-                                if columns is not None:
-                                    url, ip, user_agent, filename, status, param, time_request, referer, username, method = columns[0], columns[1], columns[2], columns[3], columns[4], columns[5], columns[6], columns[7], columns[8], columns[9]
-                                    self.iis.filter_export_anomaly_request(url, ip, status, time_request, user_agent, path_extract)
-                                    self.iis.statistic_ip(ip, status)
-                                    self.iis.filter_unique_useragent(user_agent, line, path_extract)
-                                    self.iis.statistic_filename_request(time_request, method, filename, param, url, status)
-                                    self.iis.enumerate_username(username)
-                            # Apache
-                            case 2:
-                                ip, referer, url, status, user_agent, time_request, username, method = self.apache.identify_column(line)
-                                self.apache.filter_export_anomaly_request(url, ip, status, time_request, user_agent, path_extract)
-                                self.apache.filter_unique_useragent(user_agent, line, path_extract)
-                                self.apache.statistic_ip(ip, status)
-                                self.apache.statistic_filename_request(time_request, method, url, status)
-                                self.apache.enumerate_username(username)
-        # export
+
+    def export_log(self, path_extract):
         self.export.export_user_agent(path_extract)
         self.export.export_statistic_ip(path_extract)
         self.export.export_statistic_file_request(path_extract)
         self.export.export_statistic_file_request_2(path_extract)
         self.export.export_username(path_extract)
-        print(f'Complete {time.time()-start}')
+        csv_log = []
+        for file in os.listdir(os.path.join(path_extract, 'result')):
+            if file.lower().endswith('.csv'):
+                csv_log.append(os.path.join(path_extract, 'result', file))
+        print('[+] Export final report excel')
+        path_xlsx = os.path.join(path_extract, 'result', 'report.xlsx')
+        with pd.ExcelWriter(path_xlsx, engine='xlsxwriter') as writer:
+            for csv_path in csv_log:
+                try:
+                    df = pd.read_csv(csv_path, encoding='utf-8')
+                    sheet_name = os.path.splitext(os.path.basename(csv_path))[0]
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception as e:
+                    print(f'Error export xlsx: {e}')
+                    continue
+        for csv_path in csv_log:
+            os.remove(csv_path)
+
+
+    def run(self):
+        path_zip, selection_mode, mode_ai = self.utilities.input_mode_path()
+        # zip file to parse multiple log
+        start_time = time.time()
+        # prepare environment
+        path_extract = self.manipulation_files.unzip(path_zip)
+        os.mkdir(os.path.join(path_extract, 'result'))
+        # write header csv feature 1
+        self.apache.write_header_attack_request(path_extract)
+
+        log_processor = {1: self.iis, 2: self.apache}.get(int(selection_mode))
+        if log_processor and path_extract:
+            for root, _, f_names in os.walk(path_extract):
+                if 'result' in root:
+                    continue
+                for f in f_names:
+                    path_log = os.path.join(root, f)
+                    with open(path_log, 'r', encoding='cp437') as file_log:
+                        line_logs = file_log.readlines()
+                    for line in line_logs:
+                        value_columns = log_processor.identify_column(line)
+                        if value_columns:
+                            ip, referer, url, status, user_agent, time_request, username, method, filename, param = value_columns
+                            log_processor.statistic_filename_request(time_request, method, url, status, filename, param)
+                            log_processor.filter_export_anomaly_request(url, ip, status, time_request, user_agent, path_extract, mode_ai)
+                            log_processor.statistic_ip(ip, status)
+                            log_processor.filter_unique_useragent(user_agent, line, path_extract)
+                            log_processor.enumerate_username(username)
+
+        self.export_log(path_extract)
+        print(f'[+] Complete {time.time() - start_time} seconds')
 
 
 if __name__ == '__main__':
