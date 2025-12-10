@@ -217,238 +217,15 @@ class Utility:
 
 
 class ScannerVulnerability:
-    def __init__(self):
+    def __init__(self, pattern_file='patterns.json'):
         #  Compile regex patterns once at the beginning and reuse them to save compilation time.
-        self.sql_injection_patterns = [
-            r"union.*select",
-            r"select.*from",
-            r"insert\s+into.*values",
-            r"update.*set",
-            r"delete\s+from",
-            r"drop\s+table",
-            r"alter\s+table",
-            r"create\s+table",
-            r"shutdown",
-            r"'\s+or\s+'1'='1",
-            r"\"\s+or\s+\"1\"=\"1",
-            r"or\s+\d+=\d+",
-            r"exec\s+xp_",
-            r"sp_executesql",
-            r"benchmark\((.*)\,(.*)\)",
-            r"sleep\(([\d\+\*\-]+)\)",
-            r"md5\(([0-9a-zA-Z]+)\)",
-            r"load_file\(",
-            r"base64_decode\(",
-            r"into\s+outfile",
-            r"information_schema",
-            r"master..sysdatabases",
-            r"current_user",
-            r"version\(\)",
-            r"char\(",
-            r"chr\(",
-            r"cast\(",
-            r"convert\(",
-            r"concat\(",
-            r"substring\(",
-            r"hex\(",
-            r"ascii\(",
-            r"order\s+by\s+\d+",
-            r"group\s+by\s+",
-            r"like\s+'.*%'",
-            r"\/\*.*?\*\/",
-            r"0x[0-9a-f]+",
-            r"\bwaitfor\b",
-            r"\s+and\s+",
-            r"\s+or\s+",
-            r"'\|\|'",
-        ]
-        self.compiled_sql_injection_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.sql_injection_patterns]
-        self.xss_patterns = [
-            r"<script.*?>.*?</script>",
-            r"<.*?javascript:.*?>",
-            r"<.*?on\w+\s*=\s*['\"].*?>",
-            r"<iframe.*?>.*?</iframe>",
-            r"<img.*?(src|onmouseover)(\s*)?=(\s*)?.*?>",
-            r"<.*?style.*?>.*?expression\(.*?\).*?>",
-            r"<.*?vbscript:.*?>",
-            r"document\.cookie",
-            r"document\.location",
-            r"window\.location",
-            r"document\.write\(",
-            r"alert\(",
-            r"eval\(",
-            r"prompt\(",
-            r"on\w+\s*=\s*['\"].*?(alert|eval|prompt)\(",
-            r"on\w+\s*=\s*['\"].*?window\.",
-            r"on\w+\s*=\s*['\"].*?document\.",
-            r"<link.*?href\s*=\s*['\"].*?javascript:.*?>",
-            r"<.*?src\s*=\s*['\"]\s*data:text\/html;base64,",
-            r"<object.*?>.*?</object>",
-            r"<embed.*?>.*?</embed>",
-            r"<meta.*?http-equiv\s*=\s*['\"]refresh['\"]",
-            r"<svg.*?>.*?</svg>",
-            r"<base.*?>",
-            r"<!--.*?-->",
-            r"<audio.*?>.*?</audio>",
-            r"<video.*?>.*?</video>",
-            r"<marquee.*?>.*?</marquee>",
-            r"<body.*?onload.*?>",
-            r"<input.*?type\s*=\s*['\"]hidden['\"].*?>",
-            r"%3Cscript%3E",
-            r"src\s*=\s*[\"']\s*javascript:",
-            r"src\s*=\s*[\"']\s*vbscript:",
-            r"style\s*=\s*[\"'].*?expression\(",
-            r"\balert\b",
-            r"\bconfirm\b",
-            r"\bon\w+\s*=\s*[\"'].*?>",
-            r"<\w+\s+[^>]*?on\w+\s*=\s*[\"'].*?>",
-            r"\bsrcdoc\s*=\s*['\"].*<script>.*</script>",
-            r"\bdocument\.(URL|documentURI|baseURI)",
-            r"<\s*meta\s+.*?content\s*=\s*['\"]\d+;\s*url=['\"].*?['\"]",
-            r"data:text/html;base64,",
-            r"java\s*script:",
-            r"<\s*\w+\s*.*?src\s*=\s*['\"].*?data:text/html",
-            r"<\s*svg\s*.*?on\w+\s*=",
-            r"on\w+\s*=\s*`.*`",
-            r"\bwindow\.\w+\s*\(.*\)",
-        ]
-        self.compiled_xss_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.xss_patterns]
-        self.redirection_pattern = [
-            r"redirect=",
-            r"uri=",
-            r"redirectto=",
-            r"url=",
-            r"to=",
-            r"next=",
-            r"return=",
-            r"dest=",
-        ]
-        self.compiled_redirection_pattern = [re.compile(pattern, re.IGNORECASE) for pattern in self.redirection_pattern]
-        self.path_traversal_patterns = [
-            r"\.\.\\",
-            r"\./",
-            r"\.\\",
-            r"\\\.\.\\",
-            r"/\.\./",
-            r"\\",
-            r"=\w:/",
-            r"/etc/passwd",
-            r"/etc/shadow",
-            r"/etc/group",
-            r"/proc/self/environ",
-            r"boot\.ini",
-            r"\bwin\.ini\b",
-            r"system32",
-            r"cmd\.exe",
-            r"powershell\.exe",
-            r"windows\\system32",
-            r"\\boot\\",
-            r"\\windows\\",
-            r"\b\w:\\",
-            r"file://",
-            r"php://",
-            r"zlib://",
-            r"expect://",
-            r"data://",
-            r"input://",
-            r"dir",
-        ]
-        self.compiled_path_traversal_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.path_traversal_patterns]
-        self.command_injection_patterns = [
-            r"\bsh\b",
-            r"\bbash\b",
-            r"\bcmd\b",
-            r"\bpowerShell\b",
-            r"\bperl\b",
-            r"\bpython\b",
-            r"\bcurl\b",
-            r"\bwget\b",
-            r"\bnetcat\b",
-            r"\bnc\b",
-            r"\btelnet\b",
-            r"\bftp\b",
-            r"\bscp\b",
-            r"\bssh\b",
-            r"\bnslookup\b",
-            r"\bnmap\b",
-            r"\bwhoami\b",
-            r"\bhostname\b",
-            r"\bifconfig\b",
-            r"\bipconfig\b",
-            r"\bping\b",
-            r"\btraceroute\b",
-            r"\bnmap\b",
-            r"\bkill\b",
-            r"\bpkill\b",
-            r"\bkillall\b",
-            r"\bchmod\b",
-            r"\bchown\b",
-            r"\bchgrp\b",
-            r"\btouch\b",
-            r"\brm\b",
-            r"\bmkdir\b",
-            r"\brmdir\b",
-            r"\bcurl\b",
-            r"\bftp\b",
-            r">\s*/dev/null",
-            r">\s*2>&1",
-        ]
-        self.compiled_command_injection_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.command_injection_patterns]
-        self.security_misconfiguration_patterns = [
-            r"/\.git/",
-            r"/\.svn/",
-            r"/\.hg/",
-            r"/\.DS_Store",
-            r"/\.env",
-            r"/\.htaccess",
-            r"/\.htpasswd",
-            r"/\.",
-            r"~/",
-            r"/config\.php",
-            r"/web\.config",
-            r"/nginx\.conf",
-            r"/httpd\.conf",
-            r"/server-status",
-            r"/phpinfo\.php",
-            r"/wp-config\.php",
-            r"/backup/",
-            r"/temp/",
-            r"/test/",
-            r"\bdebug=true\b",
-            r"\btrace=true\b",
-            r"\btest=true\b",
-            r"/dashboard/",
-            r"/phpMyAdmin",
-            r"/admin-console",
-            r"/jmx-console",
-            r"/manager/html",
-            r"admin/",
-            r"admin\.",
-        ]
-        self.compiled_security_misconfiguration_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.security_misconfiguration_patterns]
-        self.exchange_pattern = [
-            r'.*autodiscover\.json.*\@.*Powershell.*',
-            r'.*autodiscover\.json.*\@.*'
-        ]
-        self.compiled_exchange_pattern = [re.compile(pattern, re.IGNORECASE) for pattern in self.exchange_pattern]
-        self.false_pattern = [
-            # r'=<empty>',
-            # r'\?Cmd=Ping&',
-            # r'\?Cmd=Options&',
-            # r'\?Cmd=FolderSync&',
-            # r'\?Cmd=Sync&',
-            # r'\?Cmd=Search&',
-            # r'\?MailboxId\=[0-9a-f\-]+\@[a-zA-Z0-9\.]+',
-            # r'/WebResource.axd\?d=',
-            # r'/ScriptResource.axd\?d=',
-        ]
-        self.compiled_false_pattern = [re.compile(pattern, re.IGNORECASE) for pattern in self.false_pattern]
-        self.compiled_hex_encoding = re.compile(r'%[0-9a-fA-F]{2}')  # %XX
-        self.compiled_hex_encoding_2 = re.compile(r'x[0-9a-fA-F]{2}')  # \xXX
-        self.compiled_unicode_encoding = re.compile(r'\\u[0-9a-fA-F]{4}')  # \uXXXX
-        self.compiled_break_line = re.compile(r'[\r\n]+')  # \r\n or \n
-        self.compiled_non_printable = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
-        self.compiled_js_escape = re.compile(r'\\x[0-9a-fA-F]{2}')  # JavaScript escape \xXX
+        self.compiled_patterns = {}
+        self.false_positive_patterns = []
+        self.pattern_file = pattern_file
+
+        self.load_patterns()
+        self.init_static_patterns()
+
         # Load model AI to classify
         self.config = self._load_config(r'./model/config.json')
         self.encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
@@ -461,6 +238,40 @@ class ScannerVulnerability:
         except Exception as e:
             print(f"Error loading model from : {str(e)}")
             raise
+
+    def load_patterns(self):
+        if not os.path.exists(self.pattern_file):
+            print(f"Warning: Pattern file {self.pattern_file} not found!")
+            return
+
+        with open(self.pattern_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for vuln_type, regex_list in data.items():
+            compiled_list = [re.compile(p, re.IGNORECASE) for p in regex_list]
+            self.compiled_patterns[vuln_type] = compiled_list
+        print(f"[+] Loaded {len(self.compiled_patterns)} vulnerability categories from database.")
+
+    def init_static_patterns(self):
+        # False positives
+        self.false_pattern = [
+            r"=<empty>",
+            r"\?Cmd=Ping&",
+            r"\?Cmd=Options&",
+            r"\?Cmd=FolderSync&",
+            r"\?Cmd=Sync&",
+            r"\?Cmd=Search&",
+            r"\?MailboxId\=[0-9a-f\-]+\@[a-zA-Z0-9\.]+",
+            r"/WebResource.axd\?d=",
+            r"/ScriptResource.axd\?d="
+        ]
+        self.compiled_false_pattern = [re.compile(p, re.IGNORECASE) for p in self.false_pattern]
+
+        self.compiled_hex_encoding = re.compile(r'%[0-9a-fA-F]{2}')  # %XX
+        self.compiled_hex_encoding_2 = re.compile(r'x[0-9a-fA-F]{2}')  # \xXX
+        self.compiled_unicode_encoding = re.compile(r'\\u[0-9a-fA-F]{4}')  # \uXXXX
+        self.compiled_break_line = re.compile(r'[\r\n]+')  # \r\n or \n
+        self.compiled_non_printable = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
+        self.compiled_js_escape = re.compile(r'\\x[0-9a-fA-F]{2}')  # JavaScript escape \xXX
 
     def decode_url(self, line: str) ->  Optional[str]:
         try:
@@ -505,72 +316,19 @@ class ScannerVulnerability:
             print(f"Error decoding: '{line}': {str(e)}")
             return None
 
-
-    def detect_sql_injection(self, line: str) -> bool:
-        for pattern in self.compiled_sql_injection_patterns:
-            if pattern.search(line, re.IGNORECASE) is not None:
-                return True
-        return False
-
-    def detect_xss(self, line: str) -> bool:
-        for pattern in self.compiled_xss_patterns:
-            if pattern.search(line, re.IGNORECASE) is not None:
-                return True
-        return False
-
-    def detect_command_injection(self, line: str) -> bool:
-        for pattern in self.compiled_command_injection_patterns:
-            if pattern.search(line, re.IGNORECASE) is not None:
-                return True
-        return False
-
-    def detect_path_traversal(self, line: str) -> bool:
-        for pattern in self.compiled_path_traversal_patterns:
-            if pattern.search(line, re.IGNORECASE) is not None:
-                return True
-        return False
-
-    def detect_security_misconfiguration(self, line) -> bool:
-        for pattern in self.compiled_security_misconfiguration_patterns:
-            if pattern.search(line, re.IGNORECASE) is not None:
-                return True
-        return False
-
-    def detect_exchange_vulnerability(self, line) -> bool:
-        for pattern in self.compiled_exchange_pattern:
-            if pattern.search(line, re.IGNORECASE):
-                return True
-        return False
-
+    # exclude
     def detect_false_positive(self, line) -> bool:
         for pattern in self.compiled_false_pattern:
             if pattern.search(line):
                 return True
         return False
 
-    def detect_url_redirection(self, line) -> bool:
-        for pattern in self.compiled_redirection_pattern:
-            if pattern.search(line):
-                return True
-        return False
-
     def dispatcher(self, line: str) -> str:
-        if self.detect_exchange_vulnerability(line):
-            return 'exchange_vuln'
-        elif self.detect_sql_injection(line):
-            return 'sql-injection'
-        elif self.detect_xss(line):
-            return 'xss'
-        elif self.detect_url_redirection(line):
-            return 'redirection'
-        elif self.detect_command_injection(line):
-            return 'command-injection'
-        elif self.detect_path_traversal(line):
-            return 'path-traversal'
-        elif self.detect_security_misconfiguration(line):
-            return 'security-misconfiguration'
-        else:
-            return ''
+        for vuln_type, patterns in self.compiled_patterns.items():
+            for pattern in patterns:
+                if pattern.search(line):
+                    return vuln_type
+        return ''
 
     def _load_config(self, config_path: str) -> Dict:
         defaults = {
@@ -606,10 +364,10 @@ class ScannerVulnerability:
 
 
 class CoreFunctionality:
-    def __init__(self):
+    def __init__(self, scanner_instance):
         self.utilities = Utility()
         self.export = Export()
-        self.scanner = ScannerVulnerability()
+        self.scanner = scanner_instance
         self.manipulation_file = ManipulationFiles()
         self.path_request_attack = os.path.join('result','attack_request.csv')
         self.path_no_user_agent = os.path.join('result','no_user_agent.txt')
@@ -682,8 +440,8 @@ class CoreFunctionality:
 
 
 class IIS(CoreFunctionality):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, scanner_instance):
+        super().__init__(scanner_instance)
         self.index_column_iis = {}
 
     # Split column in IIS via describable cmt type line of IIS Server
@@ -715,7 +473,8 @@ class IIS(CoreFunctionality):
                     case 'cs-method':
                         self.index_column_iis['cs-method'] = index
         elif line.find('#') != 0:
-            columns = line.split(' ')
+            columns = line.split()
+            print(line)
             url_request = columns[self.index_column_iis['cs-uri-stem']] + ('?' + columns[self.index_column_iis['cs-uri-query']]) if columns[self.index_column_iis['cs-uri-query']] != '-' else ''
             ip = columns[self.index_column_iis['c-ip']]
             user_agent = columns[self.index_column_iis['cs(User-Agent)']]
@@ -748,8 +507,8 @@ class IIS(CoreFunctionality):
 
 
 class Apache(CoreFunctionality):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, scanner_instance):
+        super().__init__(scanner_instance)
         # %h: client ip
         # %l: The identity of the client as determined by identd (usually "-")
         # %u: The username of the client if authenticated
@@ -867,12 +626,12 @@ class Apache(CoreFunctionality):
 
 class Main:
     def __init__(self):
-        self.apache = Apache()
-        self.iis = IIS()
+        self.shared_scanner = ScannerVulnerability()
+        self.apache = Apache(self.shared_scanner)
+        self.iis = IIS(self.shared_scanner)
         self.utilities = Utility()
         self.manipulation_files = ManipulationFiles()
         self.export = Export()
-
 
     def export_log(self, path_extract):
         self.export.export_user_agent(path_extract)
@@ -897,7 +656,6 @@ class Main:
                     continue
         for csv_path in csv_log:
             os.remove(csv_path)
-
 
     def run(self):
         path_zip, selection_mode, mode_ai = self.utilities.input_mode_path()
