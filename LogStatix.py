@@ -12,7 +12,6 @@ from typing import Optional, Dict
 import base64
 import html
 import json
-import tensorflow as tf
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
@@ -208,12 +207,8 @@ class Utility:
         print('2. Apache')
         selection_mode = input('Please choice: ')
         mode_ai = input('Use AI (y/n):')
+        mode_ai = True if mode_ai == 'y' else False
         return path_zip, selection_mode, mode_ai
-        # match selection_mode:
-        #     case '1':
-        #         return 1, path_zip
-        #     case '2':
-        #         return 2, path_zip
 
 
 class ScannerVulnerability:
@@ -226,6 +221,7 @@ class ScannerVulnerability:
         self.load_patterns()
         self.init_static_patterns()
 
+    def load_mode_ai(self):
         # Load model AI to classify
         self.config = self._load_config(r'./model/config.json')
         self.encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
@@ -234,6 +230,7 @@ class ScannerVulnerability:
         if sample_embedding != expected_dim:
             raise ValueError(f"Embedding dim mismatch: expected {expected_dim}, got {sample_embedding}")
         try:
+            import tensorflow as tf
             self.model = tf.keras.models.load_model(r'./model/model.h5')
         except Exception as e:
             print(f"Error loading model from : {str(e)}")
@@ -310,7 +307,7 @@ class ScannerVulnerability:
                 if decoded == original:
                     break
             decoded = decoded.encode('ascii', errors='ignore').decode('ascii')
-            decoded = decoded.strip()
+            decoded = decoded.strip().lower()
             return decoded if decoded else None
         except Exception as e:
             print(f"Error decoding: '{line}': {str(e)}")
@@ -370,7 +367,7 @@ class CoreFunctionality:
         self.scanner = scanner_instance
         self.manipulation_file = ManipulationFiles()
         self.path_request_attack = os.path.join('result','attack_request.csv')
-        self.path_no_user_agent = os.path.join('result','no_user_agent.txt')
+        self.path_no_user_agent = os.path.join('result','no_user_agent.csv')
         self.normal_request = re.compile(r'^[a-zA-Z0-9;/&.,?+=_-]+$')
 
     # write header of feature 1, prevent if else to check per line
@@ -648,7 +645,7 @@ class Main:
         with pd.ExcelWriter(path_xlsx, engine='xlsxwriter') as writer:
             for csv_path in csv_log:
                 try:
-                    df = pd.read_csv(csv_path, encoding='utf-8')
+                    df = pd.read_csv(csv_path, encoding='utf-8', on_bad_lines='skip')
                     sheet_name = os.path.splitext(os.path.basename(csv_path))[0]
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                 except Exception as e:
@@ -659,6 +656,8 @@ class Main:
 
     def run(self):
         path_zip, selection_mode, mode_ai = self.utilities.input_mode_path()
+        if mode_ai:
+            self.shared_scanner.load_mode_ai()
         # zip file to parse multiple log
         start_time = time.time()
         # prepare environment
