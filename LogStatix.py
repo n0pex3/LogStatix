@@ -658,6 +658,7 @@ class Main:
         path_zip, selection_mode, mode_ai = self.utilities.input_mode_path()
         if mode_ai:
             self.shared_scanner.load_mode_ai()
+            print('Load successful AI model')
         # zip file to parse multiple log
         start_time = time.time()
         # prepare environment
