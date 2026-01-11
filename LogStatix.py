@@ -1,695 +1,940 @@
-import html
-import os
-import re
-from datetime import datetime
-from zipfile import ZipFile
-import csv
-import time
-import urllib.parse
-from collections import deque
-import pandas as pd
-from typing import Optional, Dict
+import abc
 import base64
+import csv
 import html
 import json
-from sentence_transformers import SentenceTransformer
-import numpy as np
+import math
+import os
+import re
+import time
+import urllib.parse
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Optional
+from zipfile import ZipFile
+
+import pandas as pd
 
 
-class UserAgent:
-    def __init__(self):
-        self.count = 1
-
-    def increase_count(self):
-        self.count += 1
-
-
-class IP:
-    def __init__(self, fail, success, total):
-        self.fail = fail
-        self.success = success
-        self.total = total
-
-    def increase_fail(self):
-        self.fail += 1
-
-    def increase_success(self):
-        self.success += 1
-
-    def increase_total(self):
-        self.total += 1
-
-
-class FileRequest:
-    def __init__(self, time_request, post, filename, count, extension, param, filename_request, success):
-        self.time_request = time_request
-        self.post = post
-        self.filename = filename
-        self.count = count
-        self.extension = extension
-        self.param = param
-        self.filename_request = filename_request
-        self.success = success
-
-    def increase_count(self):
-        self.count += 1
-
-    def increase_post(self):
-        self.post += 1
+# ==========================================
+# CONSTANTS & CONFIGURATION
+# ==========================================
+class AppConfig:
+    BATCH_SIZE = 1000
+    MAX_EXCEL_ROWS = 1000000
+    ENCODING_READ = "cp437"
+    ENCODING_WRITE = "utf-8"
+    FORMAT_DATETIME = "%d%m%Y_%H%M%S%f"
+    PATH_PATTERN = "patterns.json"
+    REGEX_NORMAl_REQ = r"^[a-zA-Z0-9;/&.,?+=_-]+$"
+    ENTROPY = 5
+    RATIO_SPEC_CHAR = 0.2
+    REGEX_EXTENSION = re.compile(
+        r"[!-~]+\.(php|xml|java|aspx|asp|py|rb|js|jsp|jspx|sh|jar|cgi|ashx|ascx|asmx|eas)",
+        re.IGNORECASE,
+    )
+    STATIC_EXTS = (
+        ".css",
+        ".js",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".ico",
+        ".svg",
+        ".html",
+        ".htm",
+    )
 
 
-class ManipulationFiles:
-    def __init__(self):
-        self.format_datetime = '%d%m%Y_%H%M%S%f'
-        self.encoding = 'UTF-8'
+class HttpDefinitions:
+    # success code startwith 2 or 3 and len 3
+    @staticmethod
+    def classify_success_or_fail(status: str):
+        return (
+            True
+            if (status.startswith("2") or status.startswith("3")) and len(status) == 3
+            else False
+        )
 
-    def unzip(self, path_archive: str) -> str:
-        zf = ZipFile(path_archive, 'r')
-        folder_name = os.path.split(path_archive)[0]
-        curr_time = datetime.now().strftime(self.format_datetime)
-        path_extract = os.path.join(folder_name, 'log_' + str(curr_time))
-        zf.extractall(path_extract)
-        zf.close()
-        return path_extract
+    # check extension of web file
+    @staticmethod
+    def is_valid_web_exts(filename: str):
+        return AppConfig.REGEX_EXTENSION.search(filename)
 
-    # write log into csv
-    def write_log_csv(self, path_log: str, content: deque):
-        with open(path_log, 'a', encoding=self.encoding, newline='') as f:
+    # webshell maybe fake by static file
+    @staticmethod
+    def _is_static_file(path: str) -> bool:
+        return path.lower().endswith(AppConfig.STATIC_EXTS)
+
+
+# ==========================================
+# DATA MODELS
+# ==========================================
+@dataclass
+class UserAgentStat:
+    count: int = 0
+
+
+@dataclass
+class IPStat:
+    fail: int = 0
+    success: int = 0
+    total: int = 0
+    first_time: str = str()
+    last_time: str = str()
+
+
+@dataclass
+class FileRequestStat:
+    time_request: str
+    post: int
+    filename: str
+    count: int
+    extension: str
+    param: str
+    filename_request: str
+    count_success: int = 0
+    count_fail: int = 0
+
+
+@dataclass
+class LogEntry:
+    ip: str
+    referer: str
+    url: str
+    status: str
+    user_agent: str
+    time_request: str
+    username: str
+    method: str
+    filename: str = str()
+    param: str = str()
+    raw_line: str = str()
+
+
+# ==========================================
+# UTILITIES
+# ==========================================
+class FileUtils:
+    @staticmethod
+    def unzip_file(path_archive: str) -> str:
+        with ZipFile(path_archive, "r") as zf:
+            folder_name = os.path.dirname(path_archive)
+            curr_time = datetime.now().strftime(AppConfig.FORMAT_DATETIME)
+            path_extract = os.path.join(folder_name, "log_" + curr_time)
+            zf.extractall(path_extract)
+            return path_extract
+
+    @staticmethod
+    def write_csv_rows(path_log: str, rows: list):
+        os.makedirs(os.path.dirname(path_log), exist_ok=True)
+        with open(path_log, "a", encoding=AppConfig.ENCODING_WRITE, newline="") as f:
             writer = csv.writer(f)
-            writer.writerows(content)
-
-    # write log into txt
-    def write_log_txt(self, path_log: str, content: str):
-        with open(path_log, 'a', encoding=self.encoding, newline='') as f:
-            f.write(content)
+            writer.writerows(rows)
 
 
-class Export:
-    list_user_agent = {}
-    list_user_agent_non_official = {}
-    list_ip = {}
-    list_file_request = {}
-    list_username = {}
-    list_file_count = {}
-
-    def __init__(self):
-        self.manipulation_file = ManipulationFiles()
-        self.path_user_agent = os.path.join('result','user_agent_official.csv')
-        self.path_user_agent_non_official = os.path.join('result','user_agent_non_official.csv')
-        self.path_statistic_ip = os.path.join('result','statistic_ip.csv')
-        self.path_file_request = os.path.join('result','file_request.csv')
-        self.path_file_request_2 = os.path.join('result','file_request_count.csv')
-        self.path_username = os.path.join('result','username.csv')
-        self.batch_size = 1000
-        # deque() for higher performance pop than list
-        self.buffer = deque()
-
-    # restrict write continuously into disk, use batch_size to check
-    def export_remain(self, path_log: str):
-        if self.buffer:
-            self.manipulation_file.write_log_csv(path_log, self.buffer)
-        self.buffer.clear()
-
-    def export_user_agent(self, path_extract: str):
-        # official user-agent
-        content = [['UserAgent', 'Count']]
-        path_log_official = os.path.join(path_extract, self.path_user_agent)
-        self.manipulation_file.write_log_csv(path_log_official, content)
-        # Non official user-agent
-        path_log_non_official = os.path.join(path_extract, self.path_user_agent_non_official)
-        self.manipulation_file.write_log_csv(path_log_non_official, content)
-        for user_agent, count in self.list_user_agent.items():
-            if user_agent is not None and user_agent.startswith('Mozilla'):
-                self.buffer.append([user_agent, count.count])
-                if len(self.buffer) >= self.batch_size:
-                    self.manipulation_file.write_log_csv(path_log_official, self.buffer)
-                    self.buffer.clear()
-            else:
-                self.manipulation_file.write_log_csv(path_log_non_official, [[user_agent, count.count]])
-        self.export_remain(path_log_official)
-
-    def export_statistic_ip(self, path_extract: str):
-        content = [['IP', 'Fail', 'Success', 'Total']]
-        path_log = os.path.join(path_extract, self.path_statistic_ip)
-        self.manipulation_file.write_log_csv(path_log, content)
-        for ip, status in self.list_ip.items():
-            self.buffer.append([ip, status.fail, status.success, status.total])
-            if len(self.buffer) >= self.batch_size:
-                self.manipulation_file.write_log_csv(path_log, self.buffer)
-                self.buffer.clear()
-        self.export_remain(path_log)
-
-    def export_statistic_file_request(self, path_extract: str):
-        header = [['time', 'post', 'filename', 'count', 'extension', 'param', 'file_request', 'url', 'success']]
-        path_log = os.path.join(path_extract, self.path_file_request)
-        self.manipulation_file.write_log_csv(path_log, header)
-        for url_request, statistic in self.list_file_request.items():
-            # Statistic count of per file request
-            Export.list_file_count[statistic.filename] += statistic.count
-            self.buffer.append([statistic.time_request, statistic.post, statistic.filename, statistic.count, statistic.extension, statistic.param,
-                       statistic.filename_request, url_request, statistic.success])
-            if len(self.buffer) >= self.batch_size:
-                self.manipulation_file.write_log_csv(path_log, self.buffer)
-                self.buffer.clear()
-        self.export_remain(path_log)
-
-    # write statistic count of per file request
-    def export_statistic_file_request_2(self, path_extract: str):
-        header = [['filename', 'count']]
-        path_log = os.path.join(path_extract, self.path_file_request_2)
-        self.manipulation_file.write_log_csv(path_log, header)
-        for filename, count in self.list_file_count.items():
-            self.manipulation_file.write_log_csv(path_log, [[filename, count]])
-
-    def export_username(self, path_extract: str):
-        header = [['username', 'count']]
-        path_log = os.path.join(path_extract, self.path_username)
-        self.manipulation_file.write_log_csv(path_log, header)
-        for username, count in self.list_username.items():
-            self.buffer.append([username, count])
-            if len(self.buffer) >= self.batch_size:
-                self.manipulation_file.write_log_csv(path_log, self.buffer)
-                self.buffer.clear()
-        self.export_remain(path_log)
+# ==========================================
+# Decode obfuscate request via multi layer
+# refer: https://github.com/nemesida-waf/waf-bypass
+# ==========================================
+class DecoderStrategy(abc.ABC):
+    @abc.abstractmethod
+    def decode(self, text: str) -> str:
+        pass
 
 
-class Utility:
-    def __init__(self):
-        self.success = ['200', '201', '202', '203', '204', '205', '206', '207', '208', '226']
-        self.redirection = ['300', '301', '302', '303', '304', '305', '306', '307', '308']
-        self.client_error = ['400', '401', '402', '403', '404', '405', '406', '407', '408', '409', '410', '411', '412',
-                             '413', '414', '415', '416', '417', '418', '421', '422', '423', '424', '425', '426', '428',
-                             '429', '431', '451']
-        self.server_error = ['500', '501', '502', '503', '504', '505', '506', '507', '508', '510', '511']
-        self.extension = ('.php', '.xml', '.java', '.aspx', '.axd', '.asp', '.py', '.rb', '.jsp', '.js', '.jspx', '.sh', '.jar', '.cgi', '.ashx', '.ascx', '.asmx', '.eas')
-        self.warning = 'Remember change order of columns if select type Apache. Please find #Dangerous in code to change'
-
-    # classify request is success (200,...) or fail (400, 500,...)
-    def classify_success_or_fail(self, status: str):
-        if status in self.success:
-            return True
-        elif status in self.redirection:
-            return True
-        elif status in self.client_error:
-            return False
-        elif status in self.server_error:
-            return False
-        else:
-            return None
-
-    def check_valid_file_extension(self, request: str) -> bool:
-        return True if request.endswith(self.extension) else False
-
-    def input_mode_path(self) -> int:
-        print(self.warning)
-        path_zip = input('Input path file zip: ').strip('"')
-        print('1. IIS')
-        print('2. Apache')
-        selection_mode = input('Please choice: ')
-        mode_ai = input('Use AI (y/n):')
-        mode_ai = True if mode_ai == 'y' else False
-        return path_zip, selection_mode, mode_ai
+class UrlDecoder(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # Decode encode-URL (%20, %25, +)
+        return urllib.parse.unquote_plus(text)
 
 
+class HtmlEntityDecoder(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # Decode &amp;, &#xXX;
+        return html.unescape(text)
+
+
+class IISUnicodeDecoder(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # Decode IIS %uXXXX -> char
+        return re.sub(
+            r"%u([0-9a-fA-F]{4})",
+            lambda x: chr(int(x.group(1), 16)),
+            text,
+            flags=re.IGNORECASE,
+        )
+
+
+class EscapeSequenceDecoder(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # 1. Hex escape: \x41 -> A
+        text = re.sub(
+            r"\\x([0-9a-fA-F]{2})",
+            lambda x: chr(int(x.group(1), 16)),
+            text,
+            flags=re.IGNORECASE,
+        )
+        # 2. Unicode escape: \u0041 -> A
+        text = re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda x: chr(int(x.group(1), 16)),
+            text,
+            flags=re.IGNORECASE,
+        )
+        # 3. Octal escape: \101 -> A
+        text = re.sub(r"\\([0-7]{1,3})", lambda x: chr(int(x.group(1), 8)), text)
+        return text
+
+
+class SqlCommentRemover(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # remove comment: SEL/**/ECT -> SELECT
+        return re.sub(r"/\*.*?\*/", "", text)
+
+
+class WhitespaceNormalizer(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # remove space: %09, %0a, %0b, %0c, %0d...
+        return re.sub(r"[\t\n\r\f\v\xa0]+", " ", text)
+
+
+class Base64SmartDecoder(DecoderStrategy):
+    def decode(self, text: str) -> str:
+        # only decode if length greater than 20 to prevent false
+        # if false-positive not match, please up length base64 regex
+        pattern = r"([A-Za-z0-9+/=_ -]{20,})"
+
+        def b64_replace(match):
+            original_str = match.group(0)
+            try:
+                temp_str = original_str.strip()
+                # Fix padding
+                padding = len(temp_str) % 4
+                if padding:
+                    temp_str += "=" * (4 - padding)
+                # Fix URL-safe base64
+                temp_str = temp_str.replace("-", "+").replace("_", "/")
+
+                decoded_bytes = base64.b64decode(temp_str, validate=True).decode(
+                    "utf-8", errors="ignore"
+                )
+
+                printable_chars = set(bytes(range(32, 127)) + b"\r\n\t")
+                if all(b in printable_chars for b in decoded_bytes):
+                    return decoded_bytes.decode("utf-8", errors="ignore")
+            except:
+                pass
+            return original_str
+
+        return re.sub(pattern, b64_replace, text)
+
+
+# ==========================================
+# Find attack request via pattern regex
+# ==========================================
 class ScannerVulnerability:
-    def __init__(self, pattern_file='patterns.json'):
-        #  Compile regex patterns once at the beginning and reuse them to save compilation time.
+    def __init__(self, pattern_file=AppConfig.PATH_PATTERN):
         self.compiled_patterns = {}
-        self.false_positive_patterns = []
+        self.false_patterns = []
         self.pattern_file = pattern_file
 
+        self.break_line = re.compile(r"[\r\n]+", re.IGNORECASE)
+        self.non_printable = re.compile(
+            r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", re.IGNORECASE
+        )
+
+        self.strategies: list[DecoderStrategy] = [
+            UrlDecoder(),
+            Base64SmartDecoder(),
+            IISUnicodeDecoder(),
+            EscapeSequenceDecoder(),
+            HtmlEntityDecoder(),
+            SqlCommentRemover(),
+            WhitespaceNormalizer(),
+        ]
+
         self.load_patterns()
-        self.init_static_patterns()
 
-    def load_mode_ai(self):
-        # Load model AI to classify
-        self.config = self._load_config(r'./model/config.json')
-        self.encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        expected_dim = self.config.get('embedding_dim', 384)
-        sample_embedding = self.encoder.encode("test").shape[0]
-        if sample_embedding != expected_dim:
-            raise ValueError(f"Embedding dim mismatch: expected {expected_dim}, got {sample_embedding}")
-        try:
-            import tensorflow as tf
-            self.model = tf.keras.models.load_model(r'./model/model.h5')
-        except Exception as e:
-            print(f"Error loading model from : {str(e)}")
-            raise
-
+    # db in patters.txt
     def load_patterns(self):
         if not os.path.exists(self.pattern_file):
             print(f"Warning: Pattern file {self.pattern_file} not found!")
             return
 
-        with open(self.pattern_file, 'r', encoding='utf-8') as f:
+        with open(self.pattern_file, "r", encoding=AppConfig.ENCODING_READ) as f:
             data = json.load(f)
+
         for vuln_type, regex_list in data.items():
             compiled_list = [re.compile(p, re.IGNORECASE) for p in regex_list]
-            self.compiled_patterns[vuln_type] = compiled_list
-        print(f"[+] Loaded {len(self.compiled_patterns)} vulnerability categories from database.")
+            if vuln_type == "false-positive":
+                self.false_patterns = compiled_list
+            else:
+                self.compiled_patterns[vuln_type] = compiled_list
 
-    def init_static_patterns(self):
-        # False positives
-        self.false_pattern = [
-            r"=<empty>",
-            r"\?Cmd=Ping&",
-            r"\?Cmd=Options&",
-            r"\?Cmd=FolderSync&",
-            r"\?Cmd=Sync&",
-            r"\?Cmd=Search&",
-            r"\?MailboxId\=[0-9a-f\-]+\@[a-zA-Z0-9\.]+",
-            r"/WebResource.axd\?d=",
-            r"/ScriptResource.axd\?d="
-        ]
-        self.compiled_false_pattern = [re.compile(p, re.IGNORECASE) for p in self.false_pattern]
+        print(f"[+] Loaded {len(self.compiled_patterns)} vulnerability categories.")
 
-        self.compiled_hex_encoding = re.compile(r'%[0-9a-fA-F]{2}')  # %XX
-        self.compiled_hex_encoding_2 = re.compile(r'x[0-9a-fA-F]{2}')  # \xXX
-        self.compiled_unicode_encoding = re.compile(r'\\u[0-9a-fA-F]{4}')  # \uXXXX
-        self.compiled_break_line = re.compile(r'[\r\n]+')  # \r\n or \n
-        self.compiled_non_printable = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
-        self.compiled_js_escape = re.compile(r'\\x[0-9a-fA-F]{2}')  # JavaScript escape \xXX
-
-    def decode_url(self, line: str) ->  Optional[str]:
-        try:
-            decoded = line
-            while True:
-                original = decoded
-                # 1. Decode HTML entities (ex: &amp; -> &)
-                decoded = html.unescape(decoded)
-                # 2. Decode URL encoding (%XX, including double encoding)
-                while self.compiled_hex_encoding.search(decoded):
-                    decoded = urllib.parse.unquote(decoded)
-                # 3. Decode \xXX (hex encoding JavaScript)
-                decoded = self.compiled_hex_encoding_2.sub(
-                    lambda x: chr(int(x.group(0)[1:], 16)), decoded
-                )
-                decoded = self.compiled_js_escape.sub(
-                    lambda x: chr(int(x.group(0)[2:], 16)), decoded
-                )
-                # 4. Decode Unicode escape (\uXXXX)
-                decoded = self.compiled_unicode_encoding.sub(
-                    lambda x: chr(int(x.group(0)[2:], 16)), decoded
-                )
-                # 5. decode base64
-                try:
-                    if re.match(r'^[A-Za-z0-9+/=]+$', decoded) and len(decoded) % 4 == 0:
-                        decoded_base64 = base64.b64decode(decoded).decode('utf-8', errors='ignore')
-                        if all(ord(c) < 128 for c in decoded_base64):
-                            decoded = decoded_base64
-                except:
-                    pass
-                # 6. exclude break line
-                decoded = self.compiled_break_line.sub('', decoded)
-                decoded = self.compiled_non_printable.sub('', decoded)
-                # 7. exclude null bytes and replace by space
-                decoded = decoded.replace('\x00', ' ')
-                if decoded == original:
-                    break
-            decoded = decoded.encode('ascii', errors='ignore').decode('ascii')
-            decoded = decoded.strip().lower()
-            return decoded if decoded else None
-        except Exception as e:
-            print(f"Error decoding: '{line}': {str(e)}")
+    def decode_url(self, line: str) -> Optional[str]:
+        if not line:
             return None
 
-    # exclude
+        current_text = line
+        max_iterations = len(self.strategies) * 3
+
+        for _ in range(max_iterations):
+            previous_text = current_text
+
+            for strategy in self.strategies:
+                decoded = str()
+                # compare before and after each strategy to save time
+                while True:
+                    decoded = strategy.decode(current_text)
+                    if decoded != current_text:
+                        current_text = decoded
+                    else:
+                        break
+
+            # clean unwanted character
+            current_text = self.break_line.sub("", current_text)
+            current_text = self.non_printable.sub("", current_text)
+            current_text = current_text.replace("\x00", " ")
+
+            # loop until before and after each loop are same than break
+            if current_text == previous_text:
+                break
+
+        return (
+            current_text.encode("ascii", errors="ignore")
+            .decode("ascii")
+            .strip()
+            .lower()
+        )
+
+    # exclude false positive in db
     def detect_false_positive(self, line) -> bool:
-        for pattern in self.compiled_false_pattern:
-            if pattern.search(line):
+        return any(p.search(line) for p in self.false_patterns)
+
+    # if payload is obfuscated, entropy maybe high
+    def _calculate_entropy(self, text: str) -> float:
+        if not text:
+            return 0
+        entropy = 0
+        for x in range(256):
+            p_x = float(text.count(chr(x))) / len(text)
+            if p_x > 0:
+                entropy += -p_x * math.log(p_x, 2)
+        return entropy
+
+    def _check_webshell_suspect(self, entry: LogEntry) -> bool:
+        if not entry.url:
+            return False
+
+        parsed = urllib.parse.urlparse(entry.url)
+        path = parsed.path
+        query = parsed.query
+        method = entry.method.upper() if entry.method else ""
+
+        # POST static file, fake image webshell
+        if method.lower == "post" and HttpDefinitions._is_static_file(path):
+            return True
+
+        # GET staic file include params
+        if HttpDefinitions._is_static_file(path) and (query or method.lower == "get"):
+            return True
+
+        # analyze params of GET, entropy and special characters
+        if query:
+            # if entropy greater than threshold, it maybe fuzzing or obfuscation
+            entropy = self._calculate_entropy(query)
+            if entropy > AppConfig.ENTROPY:
                 return True
+
+            # check ratio special characters (non printable characters) if greater than threshold
+            non_alnum_count = sum(1 for c in query if not c.isalnum())
+            if (
+                len(query) > 0
+                and (non_alnum_count / len(query)) > AppConfig.RATIO_SPEC_CHAR
+            ):
+                return True
+
         return False
 
-    def dispatcher(self, line: str) -> str:
+    def dispatcher(self, line: str, entry: LogEntry) -> str:
+        type_attack = ""
         for vuln_type, patterns in self.compiled_patterns.items():
-            for pattern in patterns:
-                if pattern.search(line):
-                    return vuln_type
-        return ''
-
-    def _load_config(self, config_path: str) -> Dict:
-        defaults = {
-            "embedding_dim": 384,
-            "threshold": 0.5,
-            "batch_size": 32,
-            "model_type": "cnn_gru",
-            "num_classes": 1  # Binary
-        }
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                # print(f"Loaded config: {config}")
-                # Merge with defaults
-                defaults.update(config)
-            else:
-                print(f"Config file {config_path} not found, using defaults: {defaults}")
-        except Exception as e:
-            print(f"Error loading config {config_path}: {str(e)}, using defaults: {defaults}")
-        return defaults
-
-    def classify_request(self, decoded: str) -> Dict:
-        embeddings = self.encoder.encode(decoded).reshape((1, self.config['embedding_dim']))
-        prediction = self.model.predict(embeddings, verbose=0)
-        probability = float(prediction[0][0])
-        threshold = self.config['threshold']
-        is_attack = probability > threshold
-        return {
-            "is_attack": is_attack,
-            "probability": probability,
-        }
-
-
-class CoreFunctionality:
-    def __init__(self, scanner_instance):
-        self.utilities = Utility()
-        self.export = Export()
-        self.scanner = scanner_instance
-        self.manipulation_file = ManipulationFiles()
-        self.path_request_attack = os.path.join('result','attack_request.csv')
-        self.path_no_user_agent = os.path.join('result','no_user_agent.csv')
-        self.normal_request = re.compile(r'^[a-zA-Z0-9;/&.,?+=_-]+$')
-
-    # write header of feature 1, prevent if else to check per line
-    def write_header_attack_request(self, path_extract: str):
-        path_log = os.path.join(path_extract, self.path_request_attack)
-        content = [['Status', 'Success', 'IP', 'Url', 'Datetime', 'Type', 'UserAgent']]
-        self.manipulation_file.write_log_csv(path_log, content)
-
-    # Feature 1: Filter anomaly request
-    # Because of over ram if save into list object and write to file later, we need write it directly, no need to save list object
-    def filter_export_anomaly_request(self, url: str, ip: str, status: str, time_request: str, user_agent: str, path_extract: str, mode_ai: int):
-        path_log = os.path.join(path_extract, self.path_request_attack)
-        if url is not None:
-            if url.startswith('https://') or url.startswith('http://'):
-                url = url.strip('https://')
-                url = url.strip('http://')
-            if url:
-                if self.normal_request.match(url):
-                    decoded_url = url
-                else:
-                    decoded_url = self.scanner.decode_url(url)
-                if not self.normal_request.match(decoded_url) and not self.scanner.detect_false_positive(decoded_url):
-                    if mode_ai == 'y':
-                        classify_attack = self.scanner.classify_request(decoded_url)
-                        if classify_attack['is_attack'] and classify_attack['probability'] > 0.5:
-                            type_attack = self.scanner.dispatcher(decoded_url)
-                            content = [status, self.utilities.classify_success_or_fail(status), ip, url, time_request, type_attack, user_agent]
-                            self.export.buffer.append(content)
-                            if len(self.export.buffer) >= self.export.batch_size:
-                                self.manipulation_file.write_log_csv(path_log, self.export.buffer)
-                                self.export.buffer.clear()
-                    else:
-                        type_attack = self.scanner.dispatcher(decoded_url)
-                        content = [status, self.utilities.classify_success_or_fail(status), ip, url, time_request,
-                                   type_attack, user_agent]
-                        self.export.buffer.append(content)
-                        if len(self.export.buffer) >= self.export.batch_size:
-                            self.manipulation_file.write_log_csv(path_log, self.export.buffer)
-                            self.export.buffer.clear()
-            self.export.export_remain(path_log)
-
-    # Feature 2: List unique user agent and count
-    # Because we need to classify unique of user agent so cannot write it directly to file. If we write to file, we cannot count times of user agent
-    def filter_unique_useragent(self, user_agent: str, line: str, path_extract: str):
-        if user_agent and user_agent != '-' and user_agent != '':
-            ua = Export.list_user_agent.setdefault(user_agent, UserAgent())
-            ua.increase_count()
+            if any(p.search(line) for p in patterns):
+                type_attack = vuln_type
+                break
+        if type_attack != "":
+            return type_attack
         else:
-            self.manipulation_file.write_log_txt(os.path.join(path_extract, self.path_no_user_agent), line)
-
-    # Feature 3: Statistic ip request: success, fail,...
-    def statistic_ip(self, ip: str, status: str):
-        success_or_fail = self.utilities.classify_success_or_fail(status)
-        if ip.find(':') != -1:
-            ip = ip.split(':')[0]
-        if Export.list_ip.get(ip) is None:
-            Export.list_ip[ip] = IP(0, 0, 0)
-        Export.list_ip[ip].increase_total()
-        if success_or_fail:
-            Export.list_ip[ip].increase_success()
-        else:
-            Export.list_ip[ip].increase_fail()
-
-    # Feature 5: Statistic authentication username
-    def enumerate_username(self, username: str):
-        Export.list_username[username] = Export.list_username.get(username, 0) + 1
+            return "webshell|fuzzing" if self._check_webshell_suspect(entry) else ""
 
 
-class IIS(CoreFunctionality):
-    def __init__(self, scanner_instance):
-        super().__init__(scanner_instance)
-        self.index_column_iis = {}
-
-    # Split column in IIS via describable cmt type line of IIS Server
-    def identify_column(self, line: str):
-        if line.find('#Fields: ') == 0:
-            column_name = line[10:].split()
-            for index, column in enumerate(column_name):
-                match column:
-                    case 'ate':
-                        self.index_column_iis['date'] = index
-                    case 'date':
-                        self.index_column_iis['date'] = index
-                    case 'time':
-                        self.index_column_iis['time'] = index
-                    case 'cs-uri-stem':
-                        self.index_column_iis['cs-uri-stem'] = index
-                    case 'cs-uri-query':
-                        self.index_column_iis['cs-uri-query'] = index
-                    case 'c-ip':
-                        self.index_column_iis['c-ip'] = index
-                    case 'cs(User-Agent)':
-                        self.index_column_iis['cs(User-Agent)'] = index
-                    case 'sc-status':
-                        self.index_column_iis['sc-status'] = index
-                    case 'cs(Referer)':
-                        self.index_column_iis['cs(Referer)'] = index
-                    case 'cs-username':
-                        self.index_column_iis['cs-username'] = index
-                    case 'cs-method':
-                        self.index_column_iis['cs-method'] = index
-        elif line.find('#') != 0:
-            columns = line.split()
-            print(line)
-            url_request = columns[self.index_column_iis['cs-uri-stem']] + ('?' + columns[self.index_column_iis['cs-uri-query']]) if columns[self.index_column_iis['cs-uri-query']] != '-' else ''
-            ip = columns[self.index_column_iis['c-ip']]
-            user_agent = columns[self.index_column_iis['cs(User-Agent)']]
-            filename = columns[self.index_column_iis['cs-uri-stem']]
-            status = columns[self.index_column_iis['sc-status']]
-            param = columns[self.index_column_iis['cs-uri-query']]
-            time_request = columns[self.index_column_iis['date']] + ' ' + columns[self.index_column_iis['time']]
-            referer = columns[self.index_column_iis['cs(Referer)']]
-            username = columns[self.index_column_iis['cs-username']]
-            method = columns[self.index_column_iis['cs-method']]
-            return ip, referer, url_request, status, user_agent, time_request, username, method, filename, param
-
-    # Because column url not have parameter, it in another column, so we don't need to split like apache
-    def statistic_filename_request(self, time_request: str, method:str, url_request: str, status: str, filename_request: str, param: str):
-        index_last_dot = filename_request.rfind('.')
-        index_filename = filename_request.rfind('/')
-        filename = filename_request[index_filename+1:]
-        if index_last_dot != -1:
-            if Export.list_file_request.get(url_request) is None:
-                if self.utilities.check_valid_file_extension(filename):
-                    extension = filename_request[index_last_dot+1:]
-                    Export.list_file_request[url_request] = FileRequest(time_request, 1, filename, 1, extension, param, filename_request, self.utilities.classify_success_or_fail(status))
-                    Export.list_file_count[filename] = 0
-            elif Export.list_file_request.get(url_request) and method.lower() == 'post':
-                # increase post request, maybe upload file
-                Export.list_file_request[url_request].increase_post()
-                Export.list_file_request[url_request].increase_count()
-            else:
-                Export.list_file_request[url_request].increase_count()
+# ==========================================
+# LOG PARSERS
+# ==========================================
+class LogParser:
+    # parse each column to get value
+    def parse_line(self, line: str) -> Optional[LogEntry]:
+        raise NotImplementedError
 
 
-class Apache(CoreFunctionality):
-    def __init__(self, scanner_instance):
-        super().__init__(scanner_instance)
-        # %h: client ip
-        # %l: The identity of the client as determined by identd (usually "-")
-        # %u: The username of the client if authenticated
-        # %t: time request
-        # %z: zone time
-        # %m: method request
-        # %r: uri
-        # %v: version http
-        # %>s: status
-        # #Dangerous --> Change order column here
-        self.default_format_log = '%h %l %u %t %z %m %r %v %>s %b "%{Referer}i" "%{User-Agent}i" %a'
-        # custom_format_log = 'a %t "%{Referer}i" %h a a a a %>s a a a %m %r %v "%{User-Agent}i"'
-        self.valid_extension = re.compile(r'[!-~]+\.(php|xml|java|aspx|asp|py|rb|js|jsp|jspx|sh|jar|cgi|ashx|ascx|asmx)')
-
-    # we use default format log of apache to split column. So it will increase performance than using regex.
-    # if it uses custom format log, we change order column in field self.default_format_log of init
-    def identify_column(self, line: str):
-        parts = line.split()
-        ip = referer = uri = status = user_agent = time_request = username = method = None
-        fields = self.default_format_log.split()
-        for i, f in enumerate(fields):
-            if i < len(parts):
-                match f:
-                    case '%h':
-                        ip = parts[i]
-                    case '%r':
-                        uri = parts[i].strip('"')
-                    case '"%{Referer}i"':
-                        referer = parts[i].strip('"')
-                    case '%>s':
-                        status = parts[i]
-                    case '"%{User-Agent}i"':
-                        j = i
-                        start_user_agent = -1
-                        while j < len(parts):
-                            if parts[j].startswith('"'):
-                                start_user_agent = j
-                                j += 1
-                            elif parts[j].endswith('"') and start_user_agent > 0:
-                                user_agent = ' '.join(parts[start_user_agent:j+1]).strip('"')
-                                break
-                            else:
-                                j += 1
-                    case '%t':
-                        time_request = parts[i].strip('[')
-                    case '%u':
-                        username = parts[i].strip()
-                    case '%m':
-                        method = parts[i].strip()
-        return ip, referer, uri, status, user_agent, time_request, username, method, None, None
-
-    # Feature 4: Statistic request via extension of file
-    def statistic_filename_request(self, time_request:str, method:str, url: str, status: str, filename_request=None, param=None):
-        # get only request file, if not skip
-        if url is not None:
-            valid_file_extension = self.valid_extension.search(url)
-            if valid_file_extension is not None and self.normal_request.search(url) is not None:
-                if url is not None:
-                    # we use dictionary to classify and count unique url
-                    if Export.list_file_request.get(url) is None:
-                        index_param = url.find('?')
-                        index_fragment = url.find('#')
-                        # Find filename via parameter
-                        if index_param != -1:
-                            sub_url = url[:index_param]
-                            index_last_path = sub_url.rfind('/')
-                            file_extension = url[index_last_path+1:index_param]
-                            if self.utilities.check_valid_file_extension(file_extension) is False:
-                                return
-                        # Find filename via fragment
-                        elif index_fragment != -1:
-                            sub_url = url[:index_fragment]
-                            index_last_path = sub_url.rfind('/')
-                            file_extension = url[index_last_path+1:index_fragment]
-                            if self.utilities.check_valid_file_extension(file_extension) is False:
-                                return
-                        # If any not found, get last path that is filename
-                        else:
-                            index_last_path = url.rindex('/')
-                            file_extension = url[index_last_path+1:]
-                            if self.utilities.check_valid_file_extension(file_extension) is False:
-                                return
-                        # Get extension of filename, we use reverse find because of double extension or triple extension
-                        index_dot_extension = file_extension.rfind('.')
-                        if valid_file_extension != -1:
-                            index_extension = index_dot_extension + 1
-                            # validate index of extension is not out of array string
-                            # Because file_extension is only filename, if index_extension it not equal len file_extension that abnormal
-                            while index_extension < len(file_extension) and (file_extension[index_extension].isalnum() or file_extension[index_extension] == '.'):
-                                index_extension += 1
-                            # Check extension that we split from url if it has got extension of webshell
-                            if index_extension != len(file_extension) and self.utilities.check_valid_file_extension(file_extension) is False:
-                                return
-                            # Get param and file request
-                            query_param = url[index_last_path+1:]
-                            index_param = query_param.find('?')
-                            index_file_request = url.find('?')
-                            param = filename_request = None
-                            if index_param != -1:
-                                param = query_param[index_param+1:]
-                                filename_request = url[:index_file_request]
-                            # ['time_request, post, filename', 'count', 'extension', 'param', 'file_request', 'url', 'success']
-                            file_request = FileRequest(time_request, 1, file_extension[:index_extension], 1,
-                                                       file_extension[index_dot_extension+1:index_extension], param,
-                                                       filename_request, self.utilities.classify_success_or_fail(status))
-                            Export.list_file_request[url] = file_request
-                            Export.list_file_count[file_extension[:index_extension]] = 0
-                    elif method.lower() == 'post' and Export.list_file_request.get(url):
-                        # increase post request, maybe upload file
-                        Export.list_file_request[url].increase_post()
-                        Export.list_file_request[url].increase_count()
-                    else:
-                        Export.list_file_request[url].increase_count()
-
-
-class Main:
+class IISParser(LogParser):
     def __init__(self):
-        self.shared_scanner = ScannerVulnerability()
-        self.apache = Apache(self.shared_scanner)
-        self.iis = IIS(self.shared_scanner)
-        self.utilities = Utility()
-        self.manipulation_files = ManipulationFiles()
-        self.export = Export()
+        self.idx = {}
 
-    def export_log(self, path_extract):
-        self.export.export_user_agent(path_extract)
-        self.export.export_statistic_ip(path_extract)
-        self.export.export_statistic_file_request(path_extract)
-        self.export.export_statistic_file_request_2(path_extract)
-        self.export.export_username(path_extract)
-        csv_log = []
-        for file in os.listdir(os.path.join(path_extract, 'result')):
-            if file.lower().endswith('.csv'):
-                csv_log.append(os.path.join(path_extract, 'result', file))
-        print('[+] Export final report excel')
-        path_xlsx = os.path.join(path_extract, 'result', 'report.xlsx')
-        with pd.ExcelWriter(path_xlsx, engine='xlsxwriter') as writer:
-            for csv_path in csv_log:
+    def parse_line(self, line: str) -> Optional[LogEntry]:
+        if line.startswith("#Fields: "):
+            cols = line[9:].strip().split()
+            self.idx = {name: i for i, name in enumerate(cols)}
+            return None
+        elif line.startswith("#") or not self.idx:
+            return None
+
+        parts = line.split()
+
+        def get(name):
+            return parts[self.idx[name]] if name in self.idx else "-"
+
+        url_stem = get("cs-uri-stem")
+        url_query = get("cs-uri-query")
+        url = url_stem + ("?" + url_query if url_query != "-" else "")
+        ts = get("date") + " " + get("time")
+
+        return LogEntry(
+            ip=get("c-ip"),
+            referer=get("cs(Referer)"),
+            url=url,
+            status=get("sc-status"),
+            user_agent=get("cs(User-Agent)"),
+            time_request=ts,
+            username=get("cs-username"),
+            method=get("cs-method"),
+            filename=url_stem,
+            param=url_query,
+            raw_line=line,
+        )
+
+
+class ApacheParser(LogParser):
+    def __init__(self):
+        self.default_format = (
+            '%h %l %u %t %z %m %r %v %>s %b "%{Referer}i" "%{User-Agent}i" %a'
+        )
+
+    def parse_line(self, line: str) -> Optional[LogEntry]:
+        parts = line.split()
+        ip = referer = uri = status = user_agent = time_request = username = method = (
+            None
+        )
+        fields = self.default_format.split()
+
+        for i, f in enumerate(fields):
+            if i >= len(parts):
+                break
+            if f == "%h":
+                ip = parts[i]
+            elif f == "%r":
+                uri = parts[i].strip('"')
+            elif f == '"%{Referer}i"':
+                referer = parts[i].strip('"')
+            elif f == "%>s":
+                status = parts[i]
+            elif f == "%t":
+                time_request = parts[i].strip("[")
+            elif f == "%u":
+                username = parts[i].strip()
+            elif f == "%m":
+                method = parts[i].strip()
+            elif f == '"%{User-Agent}i"':
+                j = i
+                start_ua = -1
+                while j < len(parts):
+                    if parts[j].startswith('"'):
+                        start_ua = j
+                        j += 1
+                    elif parts[j].endswith('"') and start_ua >= 0:
+                        user_agent = " ".join(parts[start_ua : j + 1]).strip('"')
+                        break
+                    else:
+                        j += 1
+
+        return LogEntry(
+            ip=ip,
+            referer=referer,
+            url=uri,
+            status=status,
+            user_agent=user_agent,
+            time_request=time_request,
+            username=username,
+            method=method,
+            raw_line=line,
+        )
+
+
+# ==========================================
+# REPORT WRITER
+# ==========================================
+class ReportWriter:
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.result_dir = os.path.join(output_dir, "result")
+        os.makedirs(self.result_dir, exist_ok=True)
+
+        self.p_attack = os.path.join(self.result_dir, "attack_request.csv")
+        self.p_no_ua = os.path.join(self.result_dir, "no_user_agent.csv")
+        self.p_ua = os.path.join(self.result_dir, "user_agent_official.csv")
+        self.p_ua_unofficial = os.path.join(
+            self.result_dir, "user_agent_non_official.csv"
+        )
+        self.p_ip = os.path.join(self.result_dir, "statistic_ip.csv")
+        self.p_file = os.path.join(self.result_dir, "file_request.csv")
+        self.p_file_count = os.path.join(self.result_dir, "file_request_count.csv")
+        self.p_user = os.path.join(self.result_dir, "username.csv")
+
+        self.buf_attack = deque()
+        self.buf_no_ua = deque()
+
+        FileUtils.write_csv_rows(
+            self.p_attack,
+            [["Status", "Success", "IP", "Url", "Datetime", "Type", "UserAgent"]],
+        )
+        FileUtils.write_csv_rows(self.p_no_ua, [["RawLogLine"]])
+
+    def write_attack(self, row: list):
+        self.buf_attack.append(row)
+        if len(self.buf_attack) >= AppConfig.BATCH_SIZE:
+            FileUtils.write_csv_rows(self.p_attack, self.buf_attack)
+            self.buf_attack.clear()
+
+    def write_no_ua(self, line: str):
+        self.buf_no_ua.append([line.strip()])
+        if len(self.buf_no_ua) >= AppConfig.BATCH_SIZE:
+            FileUtils.write_csv_rows(self.p_no_ua, self.buf_no_ua)
+            self.buf_no_ua.clear()
+
+    def flush_buffers(self):
+        if self.buf_attack:
+            FileUtils.write_csv_rows(self.p_attack, self.buf_attack)
+        if self.buf_no_ua:
+            FileUtils.write_csv_rows(self.p_no_ua, self.buf_no_ua)
+        self.buf_attack.clear()
+        self.buf_no_ua.clear()
+
+    def export_dictionaries(
+        self, ip_stats, file_reqs, usernames, ua_stats, file_counts
+    ):
+        print("[+] Exporting CSVs...")
+        # 1. User Agents
+        ua_off, ua_unoff = [], []
+        FileUtils.write_csv_rows(self.p_ua, [["UserAgent", "Count"]])
+        FileUtils.write_csv_rows(self.p_ua_unofficial, [["UserAgent", "Count"]])
+        for ua_str, stat in ua_stats.items():
+            row = [ua_str, stat.count]
+            # refer: https://gist.github.com/pzb/b4b6f57144aea7827ae4
+            if ua_str and ua_str.startswith("Mozilla"):
+                ua_off.append(row)
+            else:
+                ua_unoff.append(row)
+            if len(ua_off) >= AppConfig.BATCH_SIZE:
+                FileUtils.write_csv_rows(self.p_ua, ua_off)
+                ua_off.clear()
+            if len(ua_unoff) >= AppConfig.BATCH_SIZE:
+                FileUtils.write_csv_rows(self.p_ua_unofficial, ua_unoff)
+                ua_unoff.clear()
+        if ua_off:
+            FileUtils.write_csv_rows(self.p_ua, ua_off)
+        if ua_unoff:
+            FileUtils.write_csv_rows(self.p_ua_unofficial, ua_unoff)
+
+        # 2. IP
+        ip_buf = []
+        FileUtils.write_csv_rows(
+            self.p_ip, [["IP", "Fail", "Success", "Total", "First", "Last"]]
+        )
+        for ip, stat in ip_stats.items():
+            ip_buf.append(
+                [
+                    ip,
+                    stat.fail,
+                    stat.success,
+                    stat.total,
+                    stat.first_time,
+                    stat.last_time,
+                ]
+            )
+            if len(ip_buf) >= AppConfig.BATCH_SIZE:
+                FileUtils.write_csv_rows(self.p_ip, ip_buf)
+                ip_buf.clear()
+        if ip_buf:
+            FileUtils.write_csv_rows(self.p_ip, ip_buf)
+
+        # 3. File Requests
+        fr_buf = []
+        FileUtils.write_csv_rows(
+            self.p_file,
+            [
+                [
+                    "time",
+                    "post",
+                    "filename",
+                    "count",
+                    "success",
+                    "fail",
+                    "extension",
+                    "param",
+                    "file_request",
+                    "url",
+                ]
+            ],
+        )
+        for url, stat in file_reqs.items():
+            fr_buf.append(
+                [
+                    stat.time_request,
+                    stat.post,
+                    stat.filename,
+                    stat.count,
+                    stat.count_success,
+                    stat.count_fail,
+                    stat.extension,
+                    stat.param,
+                    stat.filename_request,
+                    url,
+                ]
+            )
+            if len(fr_buf) >= AppConfig.BATCH_SIZE:
+                FileUtils.write_csv_rows(self.p_file, fr_buf)
+                fr_buf.clear()
+        if fr_buf:
+            FileUtils.write_csv_rows(self.p_file, fr_buf)
+
+        # 4. File Counts
+        FileUtils.write_csv_rows(self.p_file_count, [["filename", "count"]])
+        fc_buf = [[f, c] for f, c in file_counts.items()]
+        FileUtils.write_csv_rows(self.p_file_count, fc_buf)
+
+        # 5. Usernames
+        FileUtils.write_csv_rows(self.p_user, [["username", "count"]])
+        FileUtils.write_csv_rows(self.p_user, [[u, c] for u, c in usernames.items()])
+
+    def convert_to_excel(self):
+        csv_files = [
+            os.path.join(self.result_dir, f)
+            for f in os.listdir(self.result_dir)
+            if f.endswith(".csv")
+        ]
+        print(f"[+] Converting {len(csv_files)} CSV files to Excel...")
+        path_xlsx = os.path.join(self.result_dir, "report.xlsx")
+
+        # split into multiple sheet if row greater 1M
+        with pd.ExcelWriter(path_xlsx, engine="xlsxwriter") as writer:
+            for csv_path in csv_files:
                 try:
-                    df = pd.read_csv(csv_path, encoding='utf-8', on_bad_lines='skip')
-                    sheet_name = os.path.splitext(os.path.basename(csv_path))[0]
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    df = pd.read_csv(
+                        csv_path,
+                        encoding=AppConfig.ENCODING_READ,
+                        on_bad_lines="skip",
+                        low_memory=False,
+                    )
+                    base_name = os.path.splitext(os.path.basename(csv_path))[0]
+                    rows = len(df)
+                    if rows > AppConfig.MAX_EXCEL_ROWS:
+                        # jump 1M each loop
+                        for i in range(0, rows, AppConfig.MAX_EXCEL_ROWS):
+                            chunk = df.iloc[i : i + AppConfig.MAX_EXCEL_ROWS]
+                            suffix = f"_p{i // AppConfig.MAX_EXCEL_ROWS + 1}"
+                            sheet_name = base_name[: (31 - len(suffix))] + suffix
+                            chunk.to_excel(writer, sheet_name=sheet_name, index=False)
+                    else:
+                        df.to_excel(writer, sheet_name=base_name[:31], index=False)
                 except Exception as e:
-                    print(f'Error export xlsx: {e}')
-                    continue
-        for csv_path in csv_log:
-            os.remove(csv_path)
+                    print(f"Error converting {csv_path}: {e}")
+        for f in csv_files:
+            os.remove(f)
 
+
+# ==========================================
+# CORE LOGIC PROCESSOR
+# ==========================================
+class LogAnalyzer:
+    def __init__(
+        self, parser: LogParser, scanner: ScannerVulnerability, writer: ReportWriter
+    ):
+        self.parser = parser
+        self.scanner = scanner
+        self.writer = writer
+
+        self.stats_ip: Dict[str, IPStat] = {}
+        self.stats_ua: Dict[str, UserAgentStat] = {}
+        self.stats_file_req: Dict[str, FileRequestStat] = {}
+        self.stats_username: Dict[str, int] = defaultdict(int)
+        self.stats_file_count: Dict[str, int] = defaultdict(int)
+
+        self.normal_req_pattern = re.compile(AppConfig.REGEX_NORMAl_REQ, re.IGNORECASE)
+
+    def process_file(self, file_path: str):
+        with open(file_path, "r", encoding=AppConfig.ENCODING_READ) as f:
+            for line in f:
+                entry = self.parser.parse_line(line)
+                if not entry:
+                    continue
+
+                self._analyze_file_request(entry)
+                self._analyze_anomaly(entry)
+                self._analyze_ip(entry)
+                self._analyze_user_agent(entry)
+                self._analyze_username(entry)
+
+    def _analyze_file_request(self, entry: LogEntry):
+        if isinstance(self.parser, IISParser):
+            self._analyze_file_request_iis(entry)
+        elif isinstance(self.parser, ApacheParser):
+            self._analyze_file_request_apache(entry)
+
+    def _analyze_file_request_iis(self, entry: LogEntry):
+        filename_request = entry.filename
+        param = entry.param
+        url_request = entry.url
+        method = entry.method
+        status = entry.status
+        time_request = entry.time_request
+
+        if not filename_request:
+            return
+
+        index_last_dot = filename_request.rfind(".")
+        index_filename = filename_request.rfind("/")
+        filename = filename_request[index_filename + 1 :]
+        is_success_now = HttpDefinitions.classify_success_or_fail(status)
+        # if exist, update first to save time
+        if self.stats_file_req.get(url_request):
+            stat = self.stats_file_req[url_request]
+            stat.count += 1
+            if is_success_now:
+                stat.count_success += 1
+            else:
+                stat.count_fail += 1
+            if method.lower() == "post":
+                stat.post += 1
+            return
+
+        if index_last_dot != -1 and HttpDefinitions.is_valid_web_exts(filename):
+            extension = filename_request[index_last_dot + 1 :]
+            self.stats_file_req[url_request] = FileRequestStat(
+                time_request=time_request,
+                post=(1 if method.lower() == "post" else 0),
+                filename=filename,
+                count=1,
+                extension=extension,
+                param=param,
+                filename_request=filename_request,
+                count_success=(1 if is_success_now else 0),
+                count_fail=(0 if is_success_now else 1),
+            )
+
+    def _analyze_file_request_apache(self, entry: LogEntry):
+        url = entry.url
+        if url is None:
+            return
+
+        # if exist, update first to save time
+        stat = self.stats_file_req.get(url)
+        if stat:
+            is_success_now = HttpDefinitions.classify_success_or_fail(entry.status)
+            stat.count += 1
+            if is_success_now:
+                stat.count_success += 1
+            else:
+                stat.count_fail += 1
+            if entry.method and entry.method.lower() == "post":
+                stat.post += 1
+            return
+
+        is_success_now = HttpDefinitions.classify_success_or_fail(entry.status)
+
+        # use urlparse to optimize code
+        parsed = urllib.parse.urlparse(url)
+        # this is path file, not contain param or fragment
+        path = parsed.path
+
+        if not path:
+            return
+
+        valid_ext = HttpDefinitions.is_valid_web_exts(path)
+        if valid_ext and self.normal_req_pattern.search(path) is not None:
+            full_filename = os.path.basename(path)
+            index_dot = full_filename.rfind(".")
+
+            if index_dot != -1:
+                filename = full_filename
+                extension = full_filename[index_dot + 1 :]
+                query_param = parsed.query if parsed.query else None
+                filename_request = path
+
+                self.stats_file_req[url] = FileRequestStat(
+                    time_request=entry.time_request,
+                    post=(1 if entry.method.lower() == "post" else 0),
+                    filename=filename,
+                    count=1,
+                    extension=extension,
+                    param=query_param,
+                    filename_request=filename_request,
+                    count_success=(1 if is_success_now else 0),
+                    count_fail=(0 if is_success_now else 1),
+                )
+                self.stats_file_count[filename] = 0
+
+    def _analyze_ip(self, entry: LogEntry):
+        if not entry.ip:
+            return
+        ip = entry.ip.split(":")[0]
+        if ip not in self.stats_ip:
+            self.stats_ip[ip] = IPStat(
+                first_time=entry.time_request, last_time=entry.time_request
+            )
+
+        st = self.stats_ip[ip]
+        st.total += 1
+        st.first_time = entry.time_request
+        is_success = HttpDefinitions.classify_success_or_fail(entry.status)
+        if is_success:
+            st.success += 1
+        else:
+            st.fail += 1
+
+    def _analyze_user_agent(self, entry: LogEntry):
+        ua = entry.user_agent
+        if ua and ua != "-" and ua != "":
+            if ua not in self.stats_ua:
+                self.stats_ua[ua] = UserAgentStat()
+            self.stats_ua[ua].count += 1
+        # filter request no user agent
+        else:
+            self.writer.write_no_ua(entry.raw_line)
+
+    def _analyze_username(self, entry: LogEntry):
+        if entry.username is not None:
+            self.stats_username[entry.username] += 1
+
+    def _is_url_too_long(self, url: str, threshold: int = 500) -> bool:
+        if not url:
+            return False
+        return len(url) > threshold
+
+    def _is_too_many_params(self, url: str, threshold: int = 10) -> bool:
+        if not url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if not parsed.query:
+                return False
+
+            params = urllib.parse.parse_qsl(parsed.query)
+            return len(params) > threshold
+        except Exception:
+            return False
+
+    def _write_anomaly_log(self, entry, url, decoded_url, type_attack=""):
+        if not type_attack:
+            type_attack = self.scanner.dispatcher(decoded_url, entry)
+
+        self.writer.write_attack(
+            [
+                entry.status,
+                HttpDefinitions.classify_success_or_fail(entry.status),
+                entry.ip,
+                url,
+                entry.time_request,
+                type_attack,
+                entry.user_agent,
+            ]
+        )
+
+    def _analyze_anomaly(self, entry: LogEntry):
+        url = entry.url
+        if not url:
+            return
+
+        for scheme in ["https://", "http://"]:
+            if url.startswith(scheme):
+                url = url[len(scheme) :]
+
+        decoded_url = self.scanner.decode_url(url)
+        if self.scanner.detect_false_positive(decoded_url):
+            return
+
+        # check 3 signature of attack request
+        if self._is_url_too_long(url):
+            self._write_anomaly_log(entry, url, "", "url_long")
+            return
+        if self._is_too_many_params(url):
+            self._write_anomaly_log(entry, url, "", "many_param")
+            return
+        if not self.normal_req_pattern.match(url):
+            self._write_anomaly_log(entry, url, decoded_url)
+            return
+
+    def finalize_export(self):
+        for stat in self.stats_file_req.values():
+            self.stats_file_count[stat.filename] += stat.count
+
+        self.writer.flush_buffers()
+        self.writer.export_dictionaries(
+            self.stats_ip,
+            self.stats_file_req,
+            self.stats_username,
+            self.stats_ua,
+            self.stats_file_count,
+        )
+        self.writer.convert_to_excel()
+
+
+# ==========================================
+# MAIN APP
+# ==========================================
+class LogStatixApp:
     def run(self):
-        path_zip, selection_mode, mode_ai = self.utilities.input_mode_path()
-        if mode_ai:
-            self.shared_scanner.load_mode_ai()
-            print('Load successful AI model')
-        # zip file to parse multiple log
+        print(
+            "Remember change order of columns if select type Apache. Please find #Dangerous in code to change"
+        )
+        path_zip = input("Input path file zip: ").strip('"')
+        print("1. IIS")
+        print("2. Apache")
+        mode = input("Please choice: ")
+
         start_time = time.time()
-        # prepare environment
-        path_extract = self.manipulation_files.unzip(path_zip)
-        os.mkdir(os.path.join(path_extract, 'result'))
-        # write header csv feature 1
-        self.apache.write_header_attack_request(path_extract)
+        path_extract = FileUtils.unzip_file(path_zip)
+        print(f"[+] Extracted to: {path_extract}")
 
-        log_processor = {1: self.iis, 2: self.apache}.get(int(selection_mode))
-        if log_processor and path_extract:
-            for root, _, f_names in os.walk(path_extract):
-                if 'result' in root:
-                    continue
-                for f in f_names:
-                    path_log = os.path.join(root, f)
-                    with open(path_log, 'r', encoding='cp437') as file_log:
-                        line_logs = file_log.readlines()
-                    for line in line_logs:
-                        value_columns = log_processor.identify_column(line)
-                        if value_columns:
-                            ip, referer, url, status, user_agent, time_request, username, method, filename, param = value_columns
-                            log_processor.statistic_filename_request(time_request, method, url, status, filename, param)
-                            log_processor.filter_export_anomaly_request(url, ip, status, time_request, user_agent, path_extract, mode_ai)
-                            log_processor.statistic_ip(ip, status)
-                            log_processor.filter_unique_useragent(user_agent, line, path_extract)
-                            log_processor.enumerate_username(username)
+        scanner = ScannerVulnerability()
+        writer = ReportWriter(path_extract)
 
-        self.export_log(path_extract)
-        print(f'[+] Complete {time.time() - start_time} seconds')
+        parser = None
+        if mode == "1":
+            parser = IISParser()
+        elif mode == "2":
+            parser = ApacheParser()
+        else:
+            return
+
+        analyzer = LogAnalyzer(parser, scanner, writer)
+
+        print("[+] Processing logs...")
+        for root, _, files in os.walk(path_extract):
+            if "result" in root:
+                continue
+            for file in files:
+                full_path = os.path.join(root, file)
+                analyzer.process_file(full_path)
+
+        analyzer.finalize_export()
+        print(f"[+] Complete in {time.time() - start_time:.2f} seconds")
 
 
-if __name__ == '__main__':
-    main = Main()
-    main.run()
+if __name__ == "__main__":
+    app = LogStatixApp()
+    app.run()
