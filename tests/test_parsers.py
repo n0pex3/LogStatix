@@ -1,4 +1,12 @@
-import LogStatix
+from importlib import util
+from pathlib import Path
+
+# Load from file path to avoid import path issues in CI.
+MODULE_PATH = Path(__file__).resolve().parents[1] / "LogStatix.py"
+spec = util.spec_from_file_location("LogStatix", MODULE_PATH)
+assert spec and spec.loader
+LogStatix = util.module_from_spec(spec)
+spec.loader.exec_module(LogStatix)
 
 
 def test_iis_parser_parses_fields():
