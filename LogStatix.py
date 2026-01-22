@@ -53,11 +53,11 @@ class HttpDefinitions:
     # success code startwith 2 or 3 and len 3
     @staticmethod
     def classify_success_or_fail(status: str):
-        return (
-            True
-            if (status.startswith("2") or status.startswith("3")) and len(status) == 3
-            else False
-        )
+        if status is None:
+            return False
+        if not isinstance(status, str):
+            status = str(status)
+        return (status.startswith("2") or status.startswith("3")) and len(status) == 3
 
     # check extension of web file
     @staticmethod
@@ -420,20 +420,25 @@ class ApacheParser(LogParser):
         )
         self._pattern_custom = re.compile(
             r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
-            r'\[(?P<time>[^\]]+)\]\s+(?P<tz>\S+)\s+(?P<method>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+(?!")(?P<tz>\S+)\s+(?P<method>\S+)\s+'
             r'(?P<request>.+?)\s+(?P<vhost>\S+)\s+(?P<status>\S+)\s+(?P<size>\S+)\s+'
-            r'"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s+(?P<client_ip>\S+)\s*$'
+            r'"(?P<referer>(?:\\.|[^"])*)"\s+"(?P<ua>(?:\\.|[^"])*)"\s+(?P<client_ip>\S+)\s*$'
         )
         self._pattern_custom_no_tz = re.compile(
             r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
-            r'\[(?P<time>[^\]]+)\]\s+(?P<method>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+(?!")(?P<method>\S+)\s+'
             r'(?P<request>.+?)\s+(?P<vhost>\S+)\s+(?P<status>\S+)\s+(?P<size>\S+)\s+'
-            r'"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s+(?P<client_ip>\S+)\s*$'
+            r'"(?P<referer>(?:\\.|[^"])*)"\s+"(?P<ua>(?:\\.|[^"])*)"\s+(?P<client_ip>\S+)\s*$'
         )
         self._pattern_combined = re.compile(
             r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
-            r'\[(?P<time>[^\]]+)\]\s+"(?P<request>[^"]*)"\s+(?P<status>\S+)\s+'
-            r'(?P<size>\S+)\s+"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s*$'
+            r'\[(?P<time>[^\]]+)\]\s+"(?P<request>(?:\\.|[^"])*)"\s+(?P<status>\S+)\s+'
+            r'(?P<size>\S+)\s+"(?P<referer>(?:\\.|[^"])*)"\s+"(?P<ua>(?:\\.|[^"])*)"\s*$'
+        )
+        self._pattern_common = re.compile(
+            r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+"(?P<request>(?:\\.|[^"])*)"\s+(?P<status>\S+)\s+'
+            r'(?P<size>\S+)\s*$'
         )
 
     @staticmethod
@@ -448,18 +453,98 @@ class ApacheParser(LogParser):
 
     @staticmethod
     def _tokenize_line(line: str):
-        return re.findall(r'"[^"]*"|\[[^\]]*\]|\S+', line)
+        return re.findall(r'"(?:\\.|[^"])*"|\[[^\]]*\]|\S+', line)
+
+    @staticmethod
+    def _has_quoted_request(line: str) -> bool:
+        return re.search(r'\]\s+"', line) is not None
+
+    def _parse_tokenized_parts(self, parts: list[str], line: str) -> Optional[LogEntry]:
+        if len(parts) < 6:
+            return None
+
+        ip = parts[0]
+        user = parts[2]
+        time_request = parts[3].strip("[]") if parts[3] else None
+
+        idx = 4
+        if idx < len(parts) and parts[idx].startswith('"'):
+            request_token = parts[idx]
+            idx += 1
+        elif idx + 1 < len(parts) and parts[idx + 1].startswith('"'):
+            tz = parts[idx]
+            if time_request:
+                time_request = f"{time_request} {tz}"
+            idx += 1
+            request_token = parts[idx]
+            idx += 1
+        else:
+            return None
+
+        method_from_request, uri = self._parse_request(request_token)
+        method = method_from_request
+        if not uri and request_token:
+            uri = request_token.strip('"')
+
+        def is_status_code(value: str) -> bool:
+            return value.isdigit() and len(value) == 3
+
+        status = None
+        if idx < len(parts) and is_status_code(parts[idx]):
+            status = parts[idx]
+            idx += 1
+        elif idx + 1 < len(parts) and is_status_code(parts[idx + 1]):
+            idx += 1
+            status = parts[idx]
+            idx += 1
+        elif idx < len(parts):
+            status = parts[idx]
+            idx += 1
+
+        if idx < len(parts):
+            idx += 1
+
+        referer = None
+        user_agent = None
+        if idx < len(parts) and parts[idx].startswith('"'):
+            referer = parts[idx].strip('"')
+            idx += 1
+        if idx < len(parts) and parts[idx].startswith('"'):
+            user_agent = parts[idx].strip('"')
+
+        return LogEntry(
+            ip=ip,
+            referer=referer,
+            url=uri,
+            status=status,
+            user_agent=user_agent,
+            time_request=time_request,
+            username=user,
+            method=method,
+            raw_line=line,
+        )
 
     def parse_line(self, line: str) -> Optional[LogEntry]:
         line = line.strip()
         if not line:
             return None
 
-        for pattern in (
-            self._pattern_custom,
-            self._pattern_custom_no_tz,
-            self._pattern_combined,
-        ):
+        parts = self._tokenize_line(line)
+        token_entry = self._parse_tokenized_parts(parts, line)
+        if token_entry:
+            return token_entry
+
+        if self._has_quoted_request(line):
+            patterns = (self._pattern_combined, self._pattern_common)
+        else:
+            patterns = (
+                self._pattern_combined,
+                self._pattern_common,
+                self._pattern_custom,
+                self._pattern_custom_no_tz,
+            )
+
+        for pattern in patterns:
             match = pattern.match(line)
             if not match:
                 continue
@@ -486,7 +571,6 @@ class ApacheParser(LogParser):
                 raw_line=line,
             )
 
-        parts = self._tokenize_line(line)
         ip = referer = uri = status = user_agent = time_request = username = method = (
             None
         )
@@ -732,9 +816,7 @@ class ReportWriter:
 # CORE LOGIC PROCESSOR
 # ==========================================
 class LogAnalyzer:
-    def __init__(
-        self, parser: LogParser, scanner: ScannerVulnerability, writer: ReportWriter
-    ):
+    def __init__(self, parser: LogParser, scanner: ScannerVulnerability, writer: ReportWriter):
         self.parser = parser
         self.scanner = scanner
         self.writer = writer
@@ -753,7 +835,6 @@ class LogAnalyzer:
                 entry = self.parser.parse_line(line)
                 if not entry:
                     continue
-
                 self._analyze_file_request(entry)
                 self._analyze_anomaly(entry)
                 self._analyze_ip(entry)
@@ -976,6 +1057,7 @@ class LogStatixApp:
             apache_parser._pattern_custom,
             apache_parser._pattern_custom_no_tz,
             apache_parser._pattern_combined,
+            apache_parser._pattern_common,
         )
 
         iis_score = 0
