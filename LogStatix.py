@@ -710,12 +710,7 @@ class ReportWriter:
         with pd.ExcelWriter(path_xlsx, engine="xlsxwriter") as writer:
             for csv_path in csv_files:
                 try:
-                    df = pd.read_csv(
-                        csv_path,
-                        encoding=AppConfig.ENCODING_READ,
-                        on_bad_lines="skip",
-                        low_memory=False,
-                    )
+                    df = pd.read_csv(csv_path, encoding=AppConfig.ENCODING_READ, on_bad_lines="skip", low_memory=False)
                     base_name = os.path.splitext(os.path.basename(csv_path))[0]
                     rows = len(df)
                     if rows > AppConfig.MAX_EXCEL_ROWS:
@@ -994,12 +989,7 @@ class LogStatixApp:
             for file in files:
                 full_path = os.path.join(root, file)
                 try:
-                    with open(
-                        full_path,
-                        "r",
-                        encoding=AppConfig.ENCODING_READ,
-                        errors="ignore",
-                    ) as f:
+                    with open(full_path, "r", encoding=AppConfig.ENCODING_READ, errors="ignore") as f:
                         for line in f:
                             if lines_checked >= max_lines:
                                 break
