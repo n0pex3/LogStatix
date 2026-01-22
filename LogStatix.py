@@ -224,7 +224,7 @@ class Base64SmartDecoder(DecoderStrategy):
                 printable_chars = set(bytes(range(32, 127)) + b"\r\n\t")
                 if all(b in printable_chars for b in decoded_bytes):
                     return decoded_bytes.decode("utf-8", errors="ignore")
-            except:
+            except Exception:
                 pass
             return original_str
 
