@@ -1,4 +1,5 @@
 import abc
+import argparse
 import base64
 import csv
 import html
@@ -218,9 +219,7 @@ class Base64SmartDecoder(DecoderStrategy):
                 # Fix URL-safe base64
                 temp_str = temp_str.replace("-", "+").replace("_", "/")
 
-                decoded_bytes = base64.b64decode(temp_str, validate=True).decode(
-                    "utf-8", errors="ignore"
-                )
+                decoded_bytes = base64.b64decode(temp_str, validate=True)
 
                 printable_chars = set(bytes(range(32, 127)) + b"\r\n\t")
                 if all(b in printable_chars for b in decoded_bytes):
@@ -305,12 +304,7 @@ class ScannerVulnerability:
             if current_text == previous_text:
                 break
 
-        return (
-            current_text.encode("ascii", errors="ignore")
-            .decode("ascii")
-            .strip()
-            .lower()
-        )
+        return current_text.encode("ascii", errors="ignore").decode("ascii").strip().lower()
 
     # exclude false positive in db
     def detect_false_positive(self, line) -> bool:
@@ -334,14 +328,14 @@ class ScannerVulnerability:
         parsed = urllib.parse.urlparse(entry.url)
         path = parsed.path
         query = parsed.query
-        method = entry.method.upper() if entry.method else ""
+        method = entry.method.lower() if entry.method else ""
 
         # POST static file, fake image webshell
-        if method.lower == "post" and HttpDefinitions._is_static_file(path):
+        if method == "post" and HttpDefinitions._is_static_file(path):
             return True
 
         # GET staic file include params
-        if HttpDefinitions._is_static_file(path) and (query or method.lower == "get"):
+        if HttpDefinitions._is_static_file(path) and (query or method == "get"):
             return True
 
         # analyze params of GET, entropy and special characters
@@ -424,43 +418,125 @@ class ApacheParser(LogParser):
         self.default_format = (
             '%h %l %u %t %z %m %r %v %>s %b "%{Referer}i" "%{User-Agent}i" %a'
         )
+        self._pattern_custom = re.compile(
+            r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+(?P<tz>\S+)\s+(?P<method>\S+)\s+'
+            r'(?P<request>.+?)\s+(?P<vhost>\S+)\s+(?P<status>\S+)\s+(?P<size>\S+)\s+'
+            r'"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s+(?P<client_ip>\S+)\s*$'
+        )
+        self._pattern_custom_no_tz = re.compile(
+            r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+(?P<method>\S+)\s+'
+            r'(?P<request>.+?)\s+(?P<vhost>\S+)\s+(?P<status>\S+)\s+(?P<size>\S+)\s+'
+            r'"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s+(?P<client_ip>\S+)\s*$'
+        )
+        self._pattern_combined = re.compile(
+            r'^(?P<ip>\S+)\s+(?P<ident>\S+)\s+(?P<user>\S+)\s+'
+            r'\[(?P<time>[^\]]+)\]\s+"(?P<request>[^"]*)"\s+(?P<status>\S+)\s+'
+            r'(?P<size>\S+)\s+"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)"\s*$'
+        )
+
+    @staticmethod
+    def _parse_request(request: str):
+        if not request:
+            return None, None
+        request = request.strip('"')
+        parts = request.split()
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+        return None, request
+
+    @staticmethod
+    def _tokenize_line(line: str):
+        return re.findall(r'"[^"]*"|\[[^\]]*\]|\S+', line)
 
     def parse_line(self, line: str) -> Optional[LogEntry]:
-        parts = line.split()
+        line = line.strip()
+        if not line:
+            return None
+
+        for pattern in (
+            self._pattern_custom,
+            self._pattern_custom_no_tz,
+            self._pattern_combined,
+        ):
+            match = pattern.match(line)
+            if not match:
+                continue
+            data = match.groupdict()
+            time_request = data.get("time")
+            tz = data.get("tz")
+            if time_request and tz:
+                time_request = f"{time_request} {tz}"
+            request = data.get("request")
+            method_from_request, uri = self._parse_request(request)
+            method = data.get("method") or method_from_request
+            if not uri and request:
+                uri = request.strip('"')
+
+            return LogEntry(
+                ip=data.get("ip"),
+                referer=data.get("referer"),
+                url=uri,
+                status=data.get("status"),
+                user_agent=data.get("ua"),
+                time_request=time_request,
+                username=data.get("user"),
+                method=method,
+                raw_line=line,
+            )
+
+        parts = self._tokenize_line(line)
         ip = referer = uri = status = user_agent = time_request = username = method = (
             None
         )
         fields = self.default_format.split()
-
-        for i, f in enumerate(fields):
-            if i >= len(parts):
-                break
+        request_line = None
+        i = 0
+        j = 0
+        while i < len(fields) and j < len(parts):
+            f = fields[i]
+            token = parts[j]
             if f == "%h":
-                ip = parts[i]
+                ip = token
             elif f == "%r":
-                uri = parts[i].strip('"')
+                request_line = token
+                if (
+                    not token.startswith('"')
+                    and j + 2 < len(parts)
+                    and parts[j + 2].upper().startswith("HTTP/")
+                ):
+                    request_line = " ".join(parts[j : j + 3])
+                    j += 2
+                elif (
+                    not token.startswith('"')
+                    and j + 1 < len(parts)
+                    and parts[j + 1].startswith("/")
+                ):
+                    request_line = " ".join(parts[j : j + 2])
+                    j += 1
+                method_from_request, uri_candidate = self._parse_request(request_line)
+                if not method and method_from_request:
+                    method = method_from_request
+                if uri_candidate:
+                    uri = uri_candidate
             elif f == '"%{Referer}i"':
-                referer = parts[i].strip('"')
+                referer = token.strip('"')
             elif f == "%>s":
-                status = parts[i]
+                status = token
             elif f == "%t":
-                time_request = parts[i].strip("[")
+                time_request = token.strip("[]")
+            elif f == "%z":
+                if time_request:
+                    time_request = f"{time_request} {token}"
             elif f == "%u":
-                username = parts[i].strip()
+                username = token.strip()
             elif f == "%m":
-                method = parts[i].strip()
+                method = token.strip()
             elif f == '"%{User-Agent}i"':
-                j = i
-                start_ua = -1
-                while j < len(parts):
-                    if parts[j].startswith('"'):
-                        start_ua = j
-                        j += 1
-                    elif parts[j].endswith('"') and start_ua >= 0:
-                        user_agent = " ".join(parts[start_ua : j + 1]).strip('"')
-                        break
-                    else:
-                        j += 1
+                user_agent = token.strip('"')
+            i += 1
+            j += 1
 
         return LogEntry(
             ip=ip,
@@ -799,7 +875,7 @@ class LogAnalyzer:
 
         st = self.stats_ip[ip]
         st.total += 1
-        st.first_time = entry.time_request
+        st.last_time = entry.time_request
         is_success = HttpDefinitions.classify_success_or_fail(entry.status)
         if is_success:
             st.success += 1
@@ -897,18 +973,92 @@ class LogAnalyzer:
 # MAIN APP
 # ==========================================
 class LogStatixApp:
-    def run(self):
-        print(
-            "Remember change order of columns if select type Apache. Please find #Dangerous in code to change"
+    def _guess_mode(self, path_extract: str) -> str:
+        iis_header = re.compile(r"^#(Fields|Software|Version|Date):", re.IGNORECASE)
+        iis_line = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+")
+        apache_parser = ApacheParser()
+        apache_patterns = (
+            apache_parser._pattern_custom,
+            apache_parser._pattern_custom_no_tz,
+            apache_parser._pattern_combined,
         )
-        path_zip = input("Input path file zip: ").strip('"')
-        print("1. IIS")
-        print("2. Apache")
-        mode = input("Please choice: ")
+
+        iis_score = 0
+        apache_score = 0
+        max_lines = 200
+        lines_checked = 0
+
+        for root, _, files in os.walk(path_extract):
+            if "result" in root:
+                continue
+            for file in files:
+                full_path = os.path.join(root, file)
+                try:
+                    with open(
+                        full_path,
+                        "r",
+                        encoding=AppConfig.ENCODING_READ,
+                        errors="ignore",
+                    ) as f:
+                        for line in f:
+                            if lines_checked >= max_lines:
+                                break
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            lines_checked += 1
+
+                            if iis_header.match(stripped) or iis_line.match(stripped):
+                                iis_score += 2
+                            if any(p.match(stripped) for p in apache_patterns):
+                                apache_score += 2
+
+                            if iis_score >= 4 or apache_score >= 4:
+                                break
+                except OSError:
+                    continue
+            if lines_checked >= max_lines or iis_score >= 4 or apache_score >= 4:
+                break
+
+        if iis_score == 0 and apache_score == 0:
+            print("[!] Unable to detect log format; defaulting to Apache.")
+            return "2"
+
+        if iis_score >= apache_score:
+            print("[+] Detected IIS log format.")
+            return "1"
+
+        print("[+] Detected Apache log format.")
+        return "2"
+
+    def run(self, path_zip: Optional[str] = None, mode: Optional[str] = None):
+        print("Remember change order of columns if select type Apache. Please find #Dangerous in code to change")
+
+        if not path_zip:
+            path_zip = input("Input path file zip or directory: ").strip('"')
+        else:
+            path_zip = path_zip.strip('"')
 
         start_time = time.time()
-        path_extract = FileUtils.unzip_file(path_zip)
-        print(f"[+] Extracted to: {path_extract}")
+        if not os.path.exists(path_zip):
+            print(f"[!] Path not found: {path_zip}")
+            return
+
+        if os.path.isdir(path_zip):
+            path_extract = path_zip
+            print(f"[+] Using directory: {path_extract}")
+        else:
+            path_extract = FileUtils.unzip_file(path_zip)
+            print(f"[+] Extracted to: {path_extract}")
+
+        if not mode:
+            mode = self._guess_mode(path_extract)
+        else:
+            mode = mode.strip().lower()
+            if mode in ("iis", "1"):
+                mode = "1"
+            elif mode in ("apache", "2"):
+                mode = "2"
 
         scanner = ScannerVulnerability()
         writer = ReportWriter(path_extract)
@@ -936,5 +1086,16 @@ class LogStatixApp:
 
 
 if __name__ == "__main__":
+    arg_parser = argparse.ArgumentParser(description="LogStatix analyzer")
+    arg_parser.add_argument(
+        "--zip", dest="path_zip", help="Path to log ZIP file or directory"
+    )
+    arg_parser.add_argument(
+        "--mode",
+        choices=["1", "2", "iis", "apache"],
+        help="Log type (1/ iis, 2/ apache)",
+    )
+    args = arg_parser.parse_args()
+
     app = LogStatixApp()
-    app.run()
+    app.run(path_zip=args.path_zip, mode=args.mode)

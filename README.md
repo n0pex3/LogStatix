@@ -31,3 +31,26 @@
 ### 5. Username Statistics
 * Tracks and provides statistics on usernames found in the logs.
 * Helps identify suspicious login attempts or compromised accounts.
+
+## Usage
+### Install
+```
+pip install -r requirements.txt
+```
+
+### Run
+```
+python LogStatix.py --zip "path\to\logs.zip"
+python LogStatix.py --zip "path\to\log_dir" --mode apache
+```
+
+Notes:
+- `--mode` accepts `iis`, `apache`, `1`, or `2`. If omitted, LogStatix auto-detects.
+- Output is written to `result/report.xlsx` under the input directory.
+
+## Development
+```
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
