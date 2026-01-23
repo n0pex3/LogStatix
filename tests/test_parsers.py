@@ -74,3 +74,39 @@ def test_apache_parser_custom_format_with_tz():
     assert entry.referer == "-"
     assert entry.user_agent == "Mozilla/5.0"
     assert entry.time_request == "10/Oct/2000:13:55:36 +0000"
+
+
+def test_apache_parser_common_format_without_referer_ua():
+    parser = LogStatix.ApacheParser()
+    line = (
+        '127.0.0.1 - - [20/Jun/2024:14:04:16 +0700] '
+        '"POST /api/key/activate?readonly=false HTTP/1.1" 404 303'
+    )
+    entry = parser.parse_line(line)
+
+    assert entry is not None
+    assert entry.ip == "127.0.0.1"
+    assert entry.username == "-"
+    assert entry.method == "POST"
+    assert entry.url == "/api/key/activate?readonly=false"
+    assert entry.status == "404"
+    assert entry.referer is None
+    assert entry.user_agent is None
+    assert entry.time_request == "20/Jun/2024:14:04:16 +0700"
+
+
+def test_apache_parser_escaped_quotes_in_request():
+    parser = LogStatix.ApacheParser()
+    line = (
+        '127.0.0.1 - - [20/Jun/2024:14:05:00 +0700] '
+        '"GET /catalog-portal/ui/oauth/verify?error=&deviceUdid=$%7b\\"'
+        'freemarker.template.utility.Execute\\"%3fnew()(\\"cat+/etc/shells\\")%7d '
+        'HTTP/1.1" 404 295 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"'
+    )
+    entry = parser.parse_line(line)
+
+    assert entry is not None
+    assert entry.method == "GET"
+    assert entry.status == "404"
+    assert entry.url.startswith("/catalog-portal/ui/oauth/verify?error=&deviceUdid=")
