@@ -1,2 +1,5 @@
 pandas
 xlsxwriter
+
+pytest
+ruff

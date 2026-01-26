@@ -275,6 +275,7 @@ class ScannerVulnerability:
 
         print(f"[+] Loaded {len(self.compiled_patterns)} vulnerability categories.")
 
+    # deobfuscate url request until cannot decode
     def decode_url(self, line: str) -> Optional[str]:
         if not line:
             return None
@@ -310,7 +311,7 @@ class ScannerVulnerability:
     def detect_false_positive(self, line) -> bool:
         return any(p.search(line) for p in self.false_patterns)
 
-    # if payload is obfuscated, entropy maybe high
+    # if payload is obfuscated, entropy should be high
     def _calculate_entropy(self, text: str) -> float:
         if not text:
             return 0
@@ -321,6 +322,7 @@ class ScannerVulnerability:
                 entropy += -p_x * math.log(p_x, 2)
         return entropy
 
+    # suspicious static file
     def _check_webshell_suspect(self, entry: LogEntry) -> bool:
         if not entry.url:
             return False
@@ -451,22 +453,27 @@ class ApacheParser(LogParser):
             return parts[0], parts[1]
         return None, request
 
+    # use regex to split value instead using built-in method split, because of user-agent has many whitespace
     @staticmethod
     def _tokenize_line(line: str):
         return re.findall(r'"(?:\\.|[^"])*"|\[[^\]]*\]|\S+', line)
 
+    # check request if it has got quote
     @staticmethod
     def _has_quoted_request(line: str) -> bool:
         return re.search(r'\]\s+"', line) is not None
 
+    # assign list token from _tokenize_line to index column, ex: token 0 is IP, token 2 is user, token 3 is time,...
     def _parse_tokenized_parts(self, parts: list[str], line: str) -> Optional[LogEntry]:
         if len(parts) < 6:
             return None
 
+        # assign fixed-index fields
         ip = parts[0]
         user = parts[2]
         time_request = parts[3].strip("[]") if parts[3] else None
 
+        # get timezone
         idx = 4
         if idx < len(parts) and parts[idx].startswith('"'):
             request_token = parts[idx]
@@ -481,6 +488,7 @@ class ApacheParser(LogParser):
         else:
             return None
 
+        # get method and uri
         method_from_request, uri = self._parse_request(request_token)
         method = method_from_request
         if not uri and request_token:
@@ -489,6 +497,7 @@ class ApacheParser(LogParser):
         def is_status_code(value: str) -> bool:
             return value.isdigit() and len(value) == 3
 
+        # get return status code
         status = None
         if idx < len(parts) and is_status_code(parts[idx]):
             status = parts[idx]
@@ -504,6 +513,7 @@ class ApacheParser(LogParser):
         if idx < len(parts):
             idx += 1
 
+        # get referer and user-agent
         referer = None
         user_agent = None
         if idx < len(parts) and parts[idx].startswith('"'):
@@ -524,16 +534,19 @@ class ApacheParser(LogParser):
             raw_line=line,
         )
 
+    # parse line by multiple method
     def parse_line(self, line: str) -> Optional[LogEntry]:
         line = line.strip()
         if not line:
             return None
 
+        # method 1: call _tokenize_line and _parse_tokenized_parts to parse
         parts = self._tokenize_line(line)
         token_entry = self._parse_tokenized_parts(parts, line)
         if token_entry:
             return token_entry
 
+        # method 2: try regex to parse
         if self._has_quoted_request(line):
             patterns = (self._pattern_combined, self._pattern_common)
         else:
@@ -571,6 +584,7 @@ class ApacheParser(LogParser):
                 raw_line=line,
             )
 
+        # method 3: last try, use default format of apache
         ip = referer = uri = status = user_agent = time_request = username = method = (
             None
         )
@@ -1049,9 +1063,12 @@ class LogAnalyzer:
 # MAIN APP
 # ==========================================
 class LogStatixApp:
+    # guess log is iis or apache automactically
     def _guess_mode(self, path_extract: str) -> str:
+        # detect iis via keyword
         iis_header = re.compile(r"^#(Fields|Software|Version|Date):", re.IGNORECASE)
         iis_line = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+")
+        # detect apapche via regex
         apache_parser = ApacheParser()
         apache_patterns = (
             apache_parser._pattern_custom,
@@ -1085,6 +1102,7 @@ class LogStatixApp:
                             if any(p.match(stripped) for p in apache_patterns):
                                 apache_score += 2
 
+                            # only two row match format can conclude
                             if iis_score >= 4 or apache_score >= 4:
                                 break
                 except OSError:

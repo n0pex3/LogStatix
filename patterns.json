@@ -169,7 +169,8 @@
     "to=",
     "next=",
     "return=",
-    "dest="
+    "dest=",
+    "route="
   ],
   "security-misconfiguration": [
     "/\\.git/",
