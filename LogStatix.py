@@ -454,6 +454,9 @@ class ApacheParser(LogParser):
         return None, request
 
     # use regex to split value instead using built-in method split, because of user-agent has many whitespace
+    # (?:\\.|[^"])* => find request uri has began with quote or :\\
+    # \[[^\]]*\] => find time request
+    # \S+ => find sequence characters not contain whitespace
     @staticmethod
     def _tokenize_line(line: str):
         return re.findall(r'"(?:\\.|[^"])*"|\[[^\]]*\]|\S+', line)
@@ -534,7 +537,7 @@ class ApacheParser(LogParser):
             raw_line=line,
         )
 
-    # parse line by multiple method
+    # parse line by multiple method, which match first will return immediately
     def parse_line(self, line: str) -> Optional[LogEntry]:
         line = line.strip()
         if not line:
